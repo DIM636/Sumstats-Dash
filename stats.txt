@@ -1,0 +1,3 @@
+ipc
+power
+total_power 
