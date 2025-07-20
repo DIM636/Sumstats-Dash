@@ -103,8 +103,7 @@ README.md             # This file
 ## Author & License
 
 - Created by dong63.ma
-- MIT License (add your license if needed)
-
+- MIT License
 ---
 
 ## Contact & Issues
