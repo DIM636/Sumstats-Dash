@@ -25,6 +25,24 @@ import argparse
 import hashlib
 from dash.dependencies import Input, Output, State, ALL
 
+# --- 컬러 팔레트 정의 ---
+# [설명] 일관된 브랜드 컬러와 시각적 계층구조를 위한 컬러 팔레트
+COLORS = {
+    'primary': '#2c3e50',      # 진한 네이비 (메인 브랜드 컬러)
+    'secondary': '#3498db',    # 밝은 블루 (보조 컬러)
+    'accent': '#e74c3c',       # 빨강 (강조/경고)
+    'success': '#27ae60',      # 초록 (성공/완료)
+    'warning': '#f39c12',      # 주황 (경고)
+    'info': '#17a2b8',         # 청록 (정보)
+    'light': '#ecf0f1',        # 연한 회색 (배경)
+    'dark': '#2c3e50',         # 진한 회색 (텍스트)
+    'white': '#ffffff',        # 흰색
+    'gray': '#95a5a6'          # 중간 회색
+}
+
+# Plotly 차트용 컬러 팔레트
+PLOTLY_COLORS = ['#2c3e50', '#3498db', '#e74c3c', '#27ae60', '#f39c12', '#17a2b8', '#9b59b6', '#34495e']
+
 # --- study_out_dir 지정 (실행 인자/환경변수 우선) ---
 def get_study_out_dir():
     parser = argparse.ArgumentParser()
@@ -58,17 +76,6 @@ STATS_TO_FIND = load_stats_to_find('stats.txt')
 KEY_VALUE_PATTERN = re.compile(r"^\s*(\S+)\s*=\s*([-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?|[Nn][Aa][Nn])")
 
 def process_single_report(report_path: Path, stats_to_find: list, group_name: str):
-    # stat-list를 문자열로 직렬화하여 해시로 사용
-    stats_hash = hashlib.md5(','.join(stats_to_find).encode()).hexdigest()
-    cache_key = (str(report_path.resolve()), os.path.getmtime(report_path), stats_hash)
-    cached = cache.get(cache_key, default=None)
-    if cached is not None:
-        # 캐시가 4개 tuple이면, matched_keys_dict를 빈 dict로 보정
-        if isinstance(cached, tuple) and len(cached) == 4:
-            group, subgroup, run, averages = cached
-            matched_keys_dict = {}
-            return (group, subgroup, run, averages, matched_keys_dict)
-        return cached
     # group, subgroup, run 추출
     run_name = report_path.parent.name
     subgroup_name = report_path.parent.parent.name
@@ -97,9 +104,10 @@ def process_single_report(report_path: Path, stats_to_find: list, group_name: st
     # matched_keys_dict: only keep those with values
     matched_keys_dict = {stat: list(keys) for stat, keys in matched_keys_dict.items() if values_dict[stat]}
     result = (group_name, subgroup_name, run_name, averages, matched_keys_dict) if averages else None
-    cache.set(cache_key, result)
     return result
 
+
+from concurrent.futures import ProcessPoolExecutor, as_completed  # 변경: 멀티프로세싱 사용
 
 def analyze_directory(root_path: Path, stats_to_find: list):
     # [설명] 지정한 디렉토리 내 모든 결과 파일을 병렬로 분석하여 DataFrame으로 집계합니다.
@@ -109,15 +117,43 @@ def analyze_directory(root_path: Path, stats_to_find: list):
     group_name = root_path.name  # baseline_dir 또는 target_dirs의 폴더명
     results = []
     all_matched_keys = {stat: set() for stat in stats_to_find}
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(process_single_report, file, stats_to_find, group_name) for file in report_files]
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                group, subgroup, run, stats, matched_keys_dict = result
-                results.append((group, subgroup, run, stats))
-                for stat, keys in matched_keys_dict.items():
-                    all_matched_keys[stat].update(keys)
+    # 캐시 적용: 파일별로 캐시 확인 및 저장
+    stats_hash = hashlib.md5(','.join(stats_to_find).encode()).hexdigest()
+    uncached_files = []
+    cache_results = {}
+    for report_path in report_files:
+        cache_key = (str(report_path.resolve()), os.path.getmtime(report_path), stats_hash)
+        cached = cache.get(cache_key, default=None)
+        if cached is not None:
+            # 캐시가 4개 tuple이면, matched_keys_dict를 빈 dict로 보정
+            if isinstance(cached, tuple) and len(cached) == 4:
+                group, subgroup, run, averages = cached
+                matched_keys_dict = {}
+                cache_results[report_path] = (group, subgroup, run, averages, matched_keys_dict)
+            else:
+                cache_results[report_path] = cached
+        else:
+            uncached_files.append(report_path)
+    # uncached_files만 멀티프로세싱으로 처리
+    if uncached_files:
+        with ProcessPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(process_single_report, file, stats_to_find, group_name) for file in uncached_files]
+            for idx, future in enumerate(as_completed(futures)):
+                result = future.result()
+                if result:
+                    # 캐시에 저장
+                    report_path = uncached_files[idx]
+                    cache_key = (str(report_path.resolve()), os.path.getmtime(report_path), stats_hash)
+                    cache.set(cache_key, result)
+                    cache_results[report_path] = result
+    # 결과 합치기
+    for report_path in report_files:
+        result = cache_results.get(report_path)
+        if result:
+            group, subgroup, run, stats, matched_keys_dict = result
+            results.append((group, subgroup, run, stats))
+            for stat, keys in matched_keys_dict.items():
+                all_matched_keys[stat].update(keys)
     if not results:
         return None, {stat: list(keys) for stat, keys in all_matched_keys.items()}
     # group, subgroup, run, stat별로 DataFrame 생성
@@ -134,8 +170,12 @@ def analyze_directory(root_path: Path, stats_to_find: list):
     df = pd.DataFrame(records)
     if df.empty:
         return None, {stat: list(keys) for stat, keys in all_matched_keys.items()}
-    # 항상 Run 컬럼 포함해서 반환
-    return df, {stat: list(keys) for stat, keys in all_matched_keys.items()}
+    # Subgroup prefix(앞 5글자)로 병합
+    df['SubgroupPrefix'] = df['Subgroup'].str[:5]
+    # Run은 그대로 두고, Group, SubgroupPrefix, Run, Stat별로 평균
+    df_agg = df.groupby(['Group', 'SubgroupPrefix', 'Run', 'Stat'], as_index=False)['Value'].mean()
+    df_agg = df_agg.rename(columns={'SubgroupPrefix': 'Subgroup'})
+    return df_agg, {stat: list(keys) for stat, keys in all_matched_keys.items()}
 
 
 def find_subdirectories(base_path: Path, depth: int) -> list:
@@ -161,58 +201,6 @@ def find_subdirectories(base_path: Path, depth: int) -> list:
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY], background_callback_manager=background_callback_manager)
 server = app.server
 app.title = "Monaco Simulation Analyzer"
-
-# 캐시 상태 확인 함수
-def get_cache_info():
-    """
-    캐시 상태 정보를 반환
-    """
-    try:
-        cache_stats = cache.stats()
-        cache_size = len(cache)
-        cache_volume = cache.volume()
-        
-        # stats가 tuple인 경우 처리
-        if isinstance(cache_stats, dict):
-            hits = cache_stats.get('hits', 0)
-            misses = cache_stats.get('misses', 0)
-        else:
-            # stats가 tuple인 경우 (hits, misses)
-            hits, misses = cache_stats if len(cache_stats) >= 2 else (0, 0)
-        
-        hit_rate = hits / max(hits + misses, 1) * 100
-        
-        return {
-            'cache_hits': hits,
-            'cache_misses': misses,
-            'cache_size': cache_size,
-            'cache_volume': cache_volume,
-            'cache_directory': cache_directory,
-            'hit_rate': hit_rate
-        }
-    except Exception as e:
-        return {'error': str(e)}
-
-# --- 컬러 팔레트 정의 ---
-# [설명] 일관된 브랜드 컬러와 시각적 계층구조를 위한 컬러 팔레트
-COLORS = {
-    'primary': '#2c3e50',      # 진한 네이비 (메인 브랜드 컬러)
-    'secondary': '#3498db',    # 밝은 블루 (보조 컬러)
-    'accent': '#e74c3c',       # 빨강 (강조/경고)
-    'success': '#27ae60',      # 초록 (성공/완료)
-    'warning': '#f39c12',      # 주황 (경고)
-    'info': '#17a2b8',         # 청록 (정보)
-    'light': '#ecf0f1',        # 연한 회색 (배경)
-    'dark': '#2c3e50',         # 진한 회색 (텍스트)
-    'white': '#ffffff',        # 흰색
-    'gray': '#95a5a6'          # 중간 회색
-}
-
-# Plotly 차트용 컬러 팔레트
-PLOTLY_COLORS = ['#2c3e50', '#3498db', '#e74c3c', '#27ae60', '#f39c12', '#17a2b8', '#9b59b6', '#34495e']
-
-# --- 앱 레이아웃 ---
-# [설명] 대시보드의 전체 UI 구조(탭, 버튼, 설명, 데이터 저장소 등)를 정의합니다.
 discovered_dirs = find_subdirectories(Path(STUDY_OUT_DIR), depth=5)
 dir_options = [{'label': os.path.basename(p), 'value': p} for p in discovered_dirs]
 
@@ -277,6 +265,13 @@ controls = dbc.Card([
         html.Div([
             html.H5("4. Statistical Test Options", 
                     style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            # 추가: 통계 옵션 활성화 체크박스
+            dbc.Checkbox(
+                id='enable-statistical-options',
+                value=False,
+                label="Enable statistical test & effect size analysis",
+                style={"marginBottom": "10px", "fontWeight": "600", "color": COLORS['secondary']}
+            ),
             html.Div([
                 html.Label("Significance Level (α):", style={"fontWeight": "600", "marginRight": "10px"}),
                 dcc.Slider(
@@ -286,7 +281,8 @@ controls = dbc.Card([
                     tooltip={"placement": "bottom", "always_visible": False},
                     included=False,
                     updatemode='drag',
-                    className="mb-2"
+                    className="mb-2",
+                    disabled=True  # 기본 비활성화
                 ),
             ], style={"marginBottom": "18px"}),
             html.Div([
@@ -301,7 +297,8 @@ controls = dbc.Card([
                     ],
                     value="none",
                     clearable=False,
-                    style={"width": "70%"}
+                    style={"width": "70%"},
+                    disabled=True  # 기본 비활성화
                 )
             ], style={"marginBottom": "18px"}),
             html.Div([
@@ -313,7 +310,8 @@ controls = dbc.Card([
                     tooltip={"placement": "bottom", "always_visible": False},
                     included=False,
                     updatemode='drag',
-                    className="mb-2"
+                    className="mb-2",
+                    disabled=True  # 기본 비활성화
                 ),
             ])
         ], style={"marginBottom": "25px"}),
@@ -433,6 +431,7 @@ app.layout = dbc.Container([
             dcc.Store(id='stats-store', data=STATS_TO_FIND),
             dcc.Store(id='stat-matched-keys-store'), # 추가: stat-matched-keys-store
             dcc.Store(id='analysis-complete-store'), # 분석 완료 전용 Store
+            dcc.Store(id='study-out-dir-store', data=STUDY_OUT_DIR), # 추가: study_out_dir Store
             # Footer
             html.Footer([
                 html.Hr(style={"borderColor": COLORS['light'], "margin": "30px 0"}),
@@ -580,6 +579,17 @@ app.layout = dbc.Container([
 # --- 콜백 함수들 ---
 # [설명] 사용자 인터랙션(분석 시작, 진행/완료 표시, 데이터 분석, 시각화 등)에 따라 동적으로 UI를 업데이트하는 Dash 콜백 함수들입니다.
 
+# 통계 옵션 활성화 체크박스에 따라 슬라이더/드롭다운 활성화
+@app.callback(
+    [Output('alpha-slider', 'disabled'),
+     Output('correction-method-dropdown', 'disabled'),
+     Output('effect-size-threshold-slider', 'disabled')],
+    Input('enable-statistical-options', 'value')
+)
+def toggle_statistical_options(enabled):
+    disabled = not enabled
+    return [disabled, disabled, disabled]
+
 # 콜백 1: '분석 시작' 버튼 클릭 시, 스토어 초기화, 진행률 바 활성화, 버튼 비활성화
 @app.callback(
     [Output('job-start-time-store', 'data'),
@@ -594,17 +604,24 @@ app.layout = dbc.Container([
     State('baseline-dropdown', 'value'),
     State('target-checklist', 'value'),
     State('manual-path-input', 'value'),
+    State('study-out-dir-store', 'data'), # 추가
     prevent_initial_call=True,
 )
-def start_analysis_job(n_clicks, baseline_dir, target_dirs_checked, manual_paths):
-    import datetime, time
+def start_analysis_job(n_clicks, baseline_dir, target_dirs_checked, manual_paths, study_out_dir):
+    import datetime, time, os
     start_time = time.time()
-    dirs = [baseline_dir] if baseline_dir else []
+    def resolve_path(p):
+        if not p:
+            return None
+        if os.path.isabs(p):
+            return p
+        return str(Path(study_out_dir) / p)
+    dirs = [resolve_path(baseline_dir)] if baseline_dir else []
     if target_dirs_checked:
-        dirs += list(target_dirs_checked)
+        dirs += [resolve_path(p) for p in target_dirs_checked]
     if manual_paths:
-        dirs += [p.strip() for p in manual_paths.split('\n') if p.strip()]
-    dirs = list(dict.fromkeys(dirs))
+        dirs += [resolve_path(p.strip()) for p in manual_paths.split('\n') if p.strip()]
+    dirs = [d for d in dict.fromkeys(dirs) if d]
     start_str = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
     meta = {'dirs': dirs, 'start_str': start_str}
     # summary-data-store.data를 항상 None으로 리셋
@@ -683,12 +700,21 @@ def update_baseline_stats_list(stats, matched_keys):
      State("alpha-slider", "value"),
      State("correction-method-dropdown", "value"),
      State("effect-size-threshold-slider", "value"),
-     State('stats-store', 'data')],
+     State('stats-store', 'data'),
+     State('enable-statistical-options', 'value'),
+     State('study-out-dir-store', 'data')], # 추가
     background=True,
     manager=background_callback_manager,
     prevent_initial_call=True,
 )
-def run_analysis_callback(set_progress, baseline_dir, target_dirs_checked, manual_paths, alpha, correction_method, effect_size_threshold, stats_to_find):
+def run_analysis_callback(set_progress, baseline_dir, target_dirs_checked, manual_paths, alpha, correction_method, effect_size_threshold, stats_to_find, enable_statistical_options, study_out_dir):
+    import os
+    def resolve_path(p):
+        if not p:
+            return None
+        if os.path.isabs(p):
+            return p
+        return str(Path(study_out_dir) / p)
     if not baseline_dir: return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     targets = set(target_dirs_checked) if target_dirs_checked else set()
     if manual_paths:
@@ -698,7 +724,7 @@ def run_analysis_callback(set_progress, baseline_dir, target_dirs_checked, manua
     if not targets: return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     if not stats_to_find:
         stats_to_find = STATS_TO_FIND
-    root_dirs = [baseline_dir] + sorted(list(targets))
+    root_dirs = [resolve_path(baseline_dir)] + sorted([resolve_path(p) for p in targets])
     dir_names = [os.path.basename(p) for p in root_dirs]
     summaries = []
     all_matched_keys = {stat: set() for stat in stats_to_find}
@@ -717,48 +743,52 @@ def run_analysis_callback(set_progress, baseline_dir, target_dirs_checked, manua
                 targ = summaries[i].groupby(['Subgroup', 'Stat'])['Value'].mean().reset_index()
                 merged = pd.merge(targ, base, on=['Subgroup', 'Stat'], suffixes=('_target', '_baseline'))
                 merged['Change'] = ((merged['Value_target'] - merged['Value_baseline']) / merged['Value_baseline']) * 100
-                # --- p-value, effect size 계산 ---
-                pvals = []
-                ds = []
-                for _, row in merged.iterrows():
-                    sub, stat = row['Subgroup'], row['Stat']
-                    base_vals = summaries[0][(summaries[0]['Subgroup'] == sub) & (summaries[0]['Stat'] == stat)]['Value'].values
-                    targ_vals = summaries[i][(summaries[i]['Subgroup'] == sub) & (summaries[i]['Stat'] == stat)]['Value'].values
-                    if len(base_vals) > 1 and len(targ_vals) > 1:
-                        try:
-                            stat_res = ttest_ind(base_vals, targ_vals, equal_var=False, nan_policy='omit')
-                            pval = stat_res.pvalue
-                            d = cohens_d(targ_vals, base_vals)
-                        except Exception:
+                if enable_statistical_options:
+                    # --- p-value, effect size 계산 ---
+                    pvals = []
+                    ds = []
+                    for _, row in merged.iterrows():
+                        sub, stat = row['Subgroup'], row['Stat']
+                        base_vals = summaries[0][(summaries[0]['Subgroup'] == sub) & (summaries[0]['Stat'] == stat)]['Value'].values
+                        targ_vals = summaries[i][(summaries[i]['Subgroup'] == sub) & (summaries[i]['Stat'] == stat)]['Value'].values
+                        if len(base_vals) > 1 and len(targ_vals) > 1:
+                            try:
+                                stat_res = ttest_ind(base_vals, targ_vals, equal_var=False, nan_policy='omit')
+                                pval = stat_res.pvalue
+                                d = cohens_d(targ_vals, base_vals)
+                            except Exception:
+                                pval = np.nan
+                                d = np.nan
+                        else:
                             pval = np.nan
                             d = np.nan
+                        pvals.append(pval)
+                        ds.append(d)
+                    merged['p-value'] = pvals
+                    merged['effect_size'] = ds
+                    # --- 다중비교 보정 ---
+                    if correction_method and correction_method != 'none':
+                        mask = ~pd.isna(merged['p-value'])
+                        pvals_arr = merged.loc[mask, 'p-value'].values
+                        reject, pvals_corr, _, _ = multipletests(pvals_arr, alpha=alpha, method=correction_method)
+                        merged.loc[mask, 'p-adj'] = pvals_corr
+                        merged.loc[mask, 'signif'] = reject
                     else:
-                        pval = np.nan
-                        d = np.nan
-                    pvals.append(pval)
-                    ds.append(d)
-                merged['p-value'] = pvals
-                merged['effect_size'] = ds
-                # --- 다중비교 보정 ---
-                if correction_method and correction_method != 'none':
-                    mask = ~pd.isna(merged['p-value'])
-                    pvals_arr = merged.loc[mask, 'p-value'].values
-                    reject, pvals_corr, _, _ = multipletests(pvals_arr, alpha=alpha, method=correction_method)
-                    merged.loc[mask, 'p-adj'] = pvals_corr
-                    merged.loc[mask, 'signif'] = reject
-                else:
-                    merged['p-adj'] = merged['p-value']
-                    merged['signif'] = merged['p-value'] < alpha
-                merged['star'] = merged['signif'].apply(lambda x: '*' if x else '')
+                        merged['p-adj'] = merged['p-value']
+                        merged['signif'] = merged['p-value'] < alpha
+                    merged['star'] = merged['signif'].apply(lambda x: '*' if x else '')
                 # 피벗: 변화율, p-adj, 별표, effect_size
                 pivot_change = merged.pivot(index='Subgroup', columns='Stat', values='Change').reset_index().round(2)
-                pivot_padj = merged.pivot(index='Subgroup', columns='Stat', values='p-adj').reset_index().round(4)
-                pivot_star = merged.pivot(index='Subgroup', columns='Stat', values='star').reset_index()
-                pivot_d = merged.pivot(index='Subgroup', columns='Stat', values='effect_size').reset_index().round(3)
+                if enable_statistical_options:
+                    pivot_padj = merged.pivot(index='Subgroup', columns='Stat', values='p-adj').reset_index().round(4)
+                    pivot_star = merged.pivot(index='Subgroup', columns='Stat', values='star').reset_index()
+                    pivot_d = merged.pivot(index='Subgroup', columns='Stat', values='effect_size').reset_index().round(3)
                 columns = ['Subgroup']
                 for stat in pivot_change.columns:
                     if stat != 'Subgroup':
-                        columns.extend([(stat, 'Change'), (stat, 'p-adj'), (stat, 'Signif'), (stat, 'd')])
+                        columns.append((stat, 'Change'))
+                        if enable_statistical_options:
+                            columns.extend([(stat, 'p-adj'), (stat, 'Signif'), (stat, 'd')])
                 data = []
                 for idx in range(len(pivot_change)):
                     row = {'Subgroup': pivot_change.loc[idx, 'Subgroup']}
@@ -766,13 +796,14 @@ def run_analysis_callback(set_progress, baseline_dir, target_dirs_checked, manua
                         if stat == 'Subgroup':
                             continue
                         row[(stat, 'Change')] = pivot_change.loc[idx, stat]
-                        row[(stat, 'p-adj')] = pivot_padj.loc[idx, stat]
-                        row[(stat, 'Signif')] = pivot_star.loc[idx, stat]
-                        row[(stat, 'd')] = pivot_d.loc[idx, stat]
+                        if enable_statistical_options:
+                            row[(stat, 'p-adj')] = pivot_padj.loc[idx, stat]
+                            row[(stat, 'Signif')] = pivot_star.loc[idx, stat]
+                            row[(stat, 'd')] = pivot_d.loc[idx, stat]
                     data.append(row)
                 table_df = pd.DataFrame(data, columns=columns)
                 # 평균(min) 행 추가
-                stat_cols = [col for col in table_df.columns if col != 'Subgroup' and col[1] == 'Change']
+                stat_cols = [col for col in table_df.columns if col != 'Subgroup' and (col[1] == 'Change')]
                 min_row = {'Subgroup': 'mean'}
                 for stat_col in stat_cols:
                     min_row[stat_col] = table_df[stat_col].mean()
@@ -913,9 +944,10 @@ def get_pastel_gradient_color(value, vmin, vmax):
      State("alpha-slider", "value"),
      State("effect-size-threshold-slider", "value"),
      State('stats-store', 'data'),
-     State('stat-matched-keys-store', 'data')]
+     State('stat-matched-keys-store', 'data'),
+     State('enable-statistical-options', 'value')]
 )
-def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_threshold, stats_to_find, matched_keys):
+def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_threshold, stats_to_find, matched_keys, enable_statistical_options):
     output_components = []
     if change_dfs_json is None:
         output_components.append("Please start analysis or wait for it to complete.")
@@ -927,7 +959,6 @@ def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_
     for i, change_json in enumerate(change_dfs_json):
         target_dir_name = dir_names[i+1]
         comp_title = f"'{baseline_dir_name}' (Baseline) vs. '{target_dir_name}'"
-        # 파일명 생성
         now_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         output_components.extend([
             html.Hr(className="my-4"),
@@ -946,14 +977,17 @@ def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_
         for stat in stats_to_find:
             if f"{stat}_Change" not in table_df.columns:
                 table_df[f"{stat}_Change"] = np.nan
-            if f"{stat}_p-adj" not in table_df.columns:
-                table_df[f"{stat}_p-adj"] = np.nan
-            if f"{stat}_d" not in table_df.columns:
-                table_df[f"{stat}_d"] = np.nan
+            if enable_statistical_options:
+                if f"{stat}_p-adj" not in table_df.columns:
+                    table_df[f"{stat}_p-adj"] = np.nan
+                if f"{stat}_d" not in table_df.columns:
+                    table_df[f"{stat}_d"] = np.nan
         # 컬럼 순서 맞추기
         columns = ['Subgroup']
         for stat in stats_to_find:
-            columns.extend([f"{stat}_Change", f"{stat}_p-adj", f"{stat}_d"])
+            columns.append(f"{stat}_Change")
+            if enable_statistical_options:
+                columns.extend([f"{stat}_p-adj", f"{stat}_d"])
         table_df = table_df[columns]
         stat_cols = [col for col in table_df.columns if col != 'Subgroup' and col.endswith('_Change')]
         style_data_conditional = []
@@ -972,8 +1006,9 @@ def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_
         dash_columns = []
         for stat in stats_to_find:
             dash_columns.append({"name": [stat, 'Change (%)'], "id": f"{stat}_Change", "presentation": "markdown"})
-            dash_columns.append({"name": [stat, 'p-adj'], "id": f"{stat}_p-adj"})
-            dash_columns.append({"name": [stat, 'd'], "id": f"{stat}_d"})
+            if enable_statistical_options:
+                dash_columns.append({"name": [stat, 'p-adj'], "id": f"{stat}_p-adj"})
+                dash_columns.append({"name": [stat, 'd'], "id": f"{stat}_d"})
         dash_columns = [{"name": "Subgroup", "id": "Subgroup"}] + dash_columns
         # 데이터: 변화율+유의성 심벌(★)
         data = []
@@ -982,22 +1017,24 @@ def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_
             for col in table_df.columns:
                 if col.endswith('_Change'):
                     val = row[col]
-                    padj_col = col.replace('_Change', '_p-adj')
-                    d_col = col.replace('_Change', '_d')
-                    pval = row[padj_col] if padj_col in table_df.columns else None
-                    d_val = row[d_col] if d_col in table_df.columns else None
-                    # 유의성 심벌(★) 조건: p-adj < alpha
-                    symbol = ''
-                    if pd.notna(pval) and pval < alpha:
-                        symbol = ' ★'
-                    if pd.notna(val):
-                        d[col] = f"{val:.2f}{symbol}"
+                    if enable_statistical_options:
+                        padj_col = col.replace('_Change', '_p-adj')
+                        d_col = col.replace('_Change', '_d')
+                        pval = row[padj_col] if padj_col in table_df.columns else None
+                        d_val = row[d_col] if d_col in table_df.columns else None
+                        symbol = ''
+                        if pd.notna(pval) and pval < alpha:
+                            symbol = ' ★'
+                        if pd.notna(val):
+                            d[col] = f"{val:.2f}{symbol}"
+                        else:
+                            d[col] = ''
                     else:
-                        d[col] = ''
-                elif col.endswith('_p-adj'):
+                        d[col] = f"{val:.2f}" if pd.notna(val) else ''
+                elif enable_statistical_options and col.endswith('_p-adj'):
                     val = row[col]
                     d[col] = f"{val:.4f}" if pd.notna(val) else ''
-                elif col.endswith('_d'):
+                elif enable_statistical_options and col.endswith('_d'):
                     val = row[col]
                     d[col] = f"{val:.4f}" if pd.notna(val) else ''
                 else:
@@ -1017,6 +1054,8 @@ def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_
                 export_format='csv',
                 export_headers='display',
             ),
+            # 드릴다운(run-level) 그래프 컨테이너 추가
+            html.Div(id={'type': 'run-level-graph', 'index': i}),
             # Stat-to-actual-key mapping summary
             html.Div([
                 html.H6("Stat-to-actual-key mapping:"),
@@ -1265,7 +1304,8 @@ def toggle_sidebar(n_clicks, is_open):
 @app.callback(
     [Output('baseline-dropdown', 'options'),
      Output('target-checklist', 'options'),
-     Output('study-out-dir-status', 'children')],
+     Output('study-out-dir-status', 'children'),
+     Output('study-out-dir-store', 'data')],
     Input('study-out-dir-search-btn', 'n_clicks'),
     State('study-out-dir-input', 'value'),
     prevent_initial_call=True,
@@ -1273,10 +1313,41 @@ def toggle_sidebar(n_clicks, is_open):
 def update_dir_options(n_clicks, study_out_dir):
     import os
     if not study_out_dir or not os.path.isdir(study_out_dir):
-        return [], [], f"❌ Directory not found: {study_out_dir}"
+        return [], [], f"❌ Directory not found: {study_out_dir}", dash.no_update
     discovered_dirs = find_subdirectories(Path(study_out_dir), depth=2)
     dir_options = [{'label': os.path.basename(p), 'value': p} for p in discovered_dirs]
-    return dir_options, dir_options, f"✅ Directory loaded: {study_out_dir}"
+    return dir_options, dir_options, f"✅ Directory loaded: {study_out_dir}", study_out_dir
+
+# 캐시 상태 확인 함수
+def get_cache_info():
+    """
+    캐시 상태 정보를 반환
+    """
+    try:
+        cache_stats = cache.stats()
+        cache_size = len(cache)
+        cache_volume = cache.volume()
+        
+        # stats가 tuple인 경우 처리
+        if isinstance(cache_stats, dict):
+            hits = cache_stats.get('hits', 0)
+            misses = cache_stats.get('misses', 0)
+        else:
+            # stats가 tuple인 경우 (hits, misses)
+            hits, misses = cache_stats if len(cache_stats) >= 2 else (0, 0)
+        
+        hit_rate = hits / max(hits + misses, 1) * 100
+        
+        return {
+            'cache_hits': hits,
+            'cache_misses': misses,
+            'cache_size': cache_size,
+            'cache_volume': cache_volume,
+            'cache_directory': cache_directory,
+            'hit_rate': hit_rate
+        }
+    except Exception as e:
+        return {'error': str(e)}
 
 
 if __name__ == "__main__":
