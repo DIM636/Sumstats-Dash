@@ -24,6 +24,7 @@ from statsmodels.stats.multitest import multipletests
 import argparse
 import hashlib
 from dash.dependencies import Input, Output, State, ALL
+import mmap
 
 # --- 컬러 팔레트 정의 ---
 # [설명] 일관된 브랜드 컬러와 시각적 계층구조를 위한 컬러 팔레트
@@ -74,11 +75,14 @@ def load_stats_to_find(stats_file='stats.txt'):
 
 STATS_TO_FIND = load_stats_to_find('stats.txt')
 KEY_VALUE_PATTERN = re.compile(r"^\s*(\S+)\s*=\s*([-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?|[Nn][Aa][Nn])")
-
+SUB_GROUPS = ['sub1','sub2','sub3','sub4']
 def process_single_report(report_path: Path, stats_to_find: list, group_name: str):
     # group, subgroup, run 추출
     run_name = report_path.parent.name
     subgroup_name = report_path.parent.parent.name
+    for mon_test in SUB_GROUPS:
+        if mon_test in subgroup_name:
+            subgroup_name = mon_test
     # group_name은 analyze_directory에서 전달받음
     values_dict = {stat: [] for stat in stats_to_find}
     matched_keys_dict = {stat: set() for stat in stats_to_find}
@@ -741,7 +745,7 @@ def run_analysis_callback(set_progress, baseline_dir, target_dirs_checked, manua
             if summaries[i] is not None:
                 base = summaries[0].groupby(['Subgroup', 'Stat'])['Value'].mean().reset_index()
                 targ = summaries[i].groupby(['Subgroup', 'Stat'])['Value'].mean().reset_index()
-                merged = pd.merge(targ, base, on=['Subgroup', 'Stat'], suffixes=('_target', '_baseline'))
+                merged = pd.merge(targ, base, on=['Subgroup', 'Stat'], suffixes=('_target', '_baseline'), how='outer')
                 merged['Change'] = ((merged['Value_target'] - merged['Value_baseline']) / merged['Value_baseline']) * 100
                 if enable_statistical_options:
                     # --- p-value, effect size 계산 ---
@@ -770,9 +774,13 @@ def run_analysis_callback(set_progress, baseline_dir, target_dirs_checked, manua
                     if correction_method and correction_method != 'none':
                         mask = ~pd.isna(merged['p-value'])
                         pvals_arr = merged.loc[mask, 'p-value'].values
-                        reject, pvals_corr, _, _ = multipletests(pvals_arr, alpha=alpha, method=correction_method)
-                        merged.loc[mask, 'p-adj'] = pvals_corr
-                        merged.loc[mask, 'signif'] = reject
+                        if len(pvals_arr) > 0:
+                            reject, pvals_corr, _, _ = multipletests(pvals_arr, alpha=alpha, method=correction_method)
+                            merged.loc[mask, 'p-adj'] = pvals_corr
+                            merged.loc[mask, 'signif'] = reject
+                        else:
+                            merged['p-adj'] = np.nan
+                            merged['signif'] = False
                     else:
                         merged['p-adj'] = merged['p-value']
                         merged['signif'] = merged['p-value'] < alpha
@@ -795,11 +803,15 @@ def run_analysis_callback(set_progress, baseline_dir, target_dirs_checked, manua
                     for stat in pivot_change.columns:
                         if stat == 'Subgroup':
                             continue
-                        row[(stat, 'Change')] = pivot_change.loc[idx, stat]
+                        val = pivot_change.loc[idx, stat]
+                        row[(stat, 'Change')] = val if pd.notna(val) else 'N/A'
                         if enable_statistical_options:
-                            row[(stat, 'p-adj')] = pivot_padj.loc[idx, stat]
-                            row[(stat, 'Signif')] = pivot_star.loc[idx, stat]
-                            row[(stat, 'd')] = pivot_d.loc[idx, stat]
+                            padj_val = pivot_padj.loc[idx, stat] if stat in pivot_padj.columns else np.nan
+                            star_val = pivot_star.loc[idx, stat] if stat in pivot_star.columns else ''
+                            d_val = pivot_d.loc[idx, stat] if stat in pivot_d.columns else np.nan
+                            row[(stat, 'p-adj')] = padj_val if pd.notna(padj_val) else 'N/A'
+                            row[(stat, 'Signif')] = star_val if pd.notna(star_val) else 'N/A'
+                            row[(stat, 'd')] = d_val if pd.notna(d_val) else 'N/A'
                     data.append(row)
                 table_df = pd.DataFrame(data, columns=columns)
                 # 평균(min) 행 추가
@@ -1348,6 +1360,157 @@ def get_cache_info():
         }
     except Exception as e:
         return {'error': str(e)}
+
+# 1. subgroup별 샘플 파일 선정 및 offset 캐싱
+def build_all_offsets(report_files, stats_to_find, subgroups):
+    # {subgroup: offsets}
+    offsets_dict = {}
+    for subgroup in subgroups:
+        # 해당 subgroup의 첫 번째 파일을 샘플로 사용
+        for file in report_files:
+            subgroup_name = Path(file).parent.parent.name
+            if subgroup in subgroup_name:
+                offsets = build_offsets_for_subgroup(subgroup, file, stats_to_find)
+                if offsets:
+                    offsets_dict[subgroup] = offsets
+                break
+    return offsets_dict
+
+# 2. process_single_report 수정
+def process_single_report_mmap(report_path: Path, stats_to_find: list, group_name: str, offsets_dict, subgroups):
+    run_name = report_path.parent.name
+    subgroup_name = report_path.parent.parent.name
+    for mon_test in subgroups:
+        if mon_test in subgroup_name:
+            subgroup_name = mon_test
+    offsets = offsets_dict.get(subgroup_name)
+    if not offsets:
+        return None
+    values_dict = parse_file_with_offsets(str(report_path), offsets, stats_to_find)
+    if not values_dict:
+        return None
+    averages = {stat: v for stat, v in values_dict.items() if v is not None}
+    matched_keys_dict = {stat: [stat] for stat in averages}
+    result = (group_name, subgroup_name, run_name, averages, matched_keys_dict) if averages else None
+    return result
+
+# 3. analyze_directory 수정
+def analyze_directory(root_path: Path, stats_to_find: list):
+    report_files = list(root_path.rglob("*.out"))
+    if not report_files:
+        return None, {}
+    group_name = root_path.name
+    subgroups = SUB_GROUPS  # 이미 정의되어 있다고 가정
+    offsets_dict = build_all_offsets(report_files, stats_to_find, subgroups)
+    results = []
+    all_matched_keys = {stat: set() for stat in stats_to_find}
+    stats_hash = hashlib.md5(','.join(stats_to_find).encode()).hexdigest()
+    uncached_files = []
+    cache_results = {}
+    for report_path in report_files:
+        cache_key = (str(report_path.resolve()), os.path.getmtime(report_path), stats_hash)
+        cached = cache.get(cache_key, default=None)
+        if cached is not None:
+            if isinstance(cached, tuple) and len(cached) == 4:
+                group, subgroup, run, averages = cached
+                matched_keys_dict = {}
+                cache_results[report_path] = (group, subgroup, run, averages, matched_keys_dict)
+            else:
+                cache_results[report_path] = cached
+        else:
+            uncached_files.append(report_path)
+    if uncached_files:
+        with ProcessPoolExecutor(max_workers=8) as executor:
+            futures = [
+                executor.submit(process_single_report_mmap, file, stats_to_find, group_name, offsets_dict, subgroups)
+                for file in uncached_files
+            ]
+            for idx, future in enumerate(as_completed(futures)):
+                result = future.result()
+                if result:
+                    report_path = uncached_files[idx]
+                    cache_key = (str(report_path.resolve()), os.path.getmtime(report_path), stats_hash)
+                    cache.set(cache_key, result)
+                    cache_results[report_path] = result
+    for report_path in report_files:
+        result = cache_results.get(report_path)
+        if result:
+            group, subgroup, run, stats, matched_keys_dict = result
+            results.append((group, subgroup, run, stats))
+            for stat, keys in matched_keys_dict.items():
+                all_matched_keys[stat].update(keys)
+    if not results:
+        return None, {stat: list(keys) for stat, keys in all_matched_keys.items()}
+    records = []
+    for group, subgroup, run, stats in results:
+        for stat, value in stats.items():
+            records.append({
+                'Group': group,
+                'Subgroup': subgroup,
+                'Run': run,
+                'Stat': stat,
+                'Value': value
+            })
+    df = pd.DataFrame(records)
+    if df.empty:
+        return None, {stat: list(keys) for stat, keys in all_matched_keys.items()}
+    df['SubgroupPrefix'] = df['Subgroup'].str[:5]
+    df_agg = df.groupby(['Group', 'SubgroupPrefix', 'Run', 'Stat'], as_index=False)['Value'].mean()
+    df_agg = df_agg.rename(columns={'SubgroupPrefix': 'Subgroup'})
+    return df_agg, {stat: list(keys) for stat, keys in all_matched_keys.items()}
+
+def build_offsets_for_subgroup(subgroup, sample_file, stats_to_find):
+    """
+    sample_file: 해당 subgroup의 대표 파일 경로 (Path 또는 str)
+    stats_to_find: stat 리스트
+    return: {stat: offset_from_running_complete}
+    """
+    offsets = {}
+    with open(sample_file, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
+        # Running Complete 위치 찾기
+        running_idx = next((i for i, line in enumerate(lines) if 'Running Complete' in line), None)
+        if running_idx is None:
+            return None
+        for stat in stats_to_find:
+            for offset, line in enumerate(lines[running_idx+1:], 1):
+                if stat in line:
+                    offsets[stat] = offset
+                    break
+    return offsets
+
+def parse_file_with_offsets(file_path, offsets, stats_to_find):
+    """
+    file_path: 분석할 파일 경로 (str)
+    offsets: {stat: offset_from_running_complete}
+    stats_to_find: stat 리스트
+    return: {stat: value}
+    """
+    results = {}
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        mm.seek(0)
+        pos = mm.find(b'Running Complete')
+        if pos == -1:
+            mm.close()
+            return None
+        mm.seek(pos)
+        mm.readline()  # Running Complete 라인 넘기기
+        for stat in stats_to_find:
+            offset = offsets.get(stat)
+            if offset is None:
+                continue
+            mm.seek(pos)
+            mm.readline()  # Running Complete 라인
+            for _ in range(offset):
+                mm.readline()
+            line = mm.readline().decode('utf-8', errors='ignore')
+            match = KEY_VALUE_PATTERN.search(line)
+            if match:
+                _, value_str = match.groups()
+                results[stat] = float(value_str) if value_str.lower() != 'nan' else 0.0
+        mm.close()
+    return results
 
 
 if __name__ == "__main__":
