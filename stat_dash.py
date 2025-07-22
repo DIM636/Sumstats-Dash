@@ -1511,7 +1511,31 @@ def parse_file_with_offsets(file_path, offsets, stats_to_find):
                 results[stat] = float(value_str) if value_str.lower() != 'nan' else 0.0
         mm.close()
     return results
+import mmap
 
+def fast_stat_parse(file_path, stats_to_find):
+    results = {}
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        for stat in stats_to_find:
+            pos = mm.find(stat.encode('utf-8'))
+            if pos == -1:
+                continue
+            # stat이 포함된 라인으로 이동
+            mm.seek(pos)
+            # 라인 시작으로 이동
+            while mm.tell() > 0:
+                mm.seek(mm.tell() - 1)
+                if mm.read(1) == b'\n':
+                    break
+                mm.seek(mm.tell() - 1)
+            line = mm.readline().decode('utf-8', errors='ignore')
+            match = KEY_VALUE_PATTERN.search(line)
+            if match:
+                _, value_str = match.groups()
+                results[stat] = float(value_str) if value_str.lower() != 'nan' else 0.0
+        mm.close()
+    return results
 
 if __name__ == "__main__":
     app.run(debug=False)
