@@ -8,22 +8,19 @@ import pandas as pd
 import plotly.express as px
 import re
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
 import time
 import diskcache
 import datetime
 import numpy as np
 import sys
-import dash
 import plotly
-import requests
 import base64
 from scipy.stats import ttest_ind
 from statsmodels.stats.multitest import multipletests
 import argparse
 import hashlib
-from dash.dependencies import Input, Output, State, ALL
 import mmap
 
 # --- 컬러 팔레트 정의 ---
@@ -43,6 +40,23 @@ COLORS = {
 
 # Plotly 차트용 컬러 팔레트
 PLOTLY_COLORS = ['#2c3e50', '#3498db', '#e74c3c', '#27ae60', '#f39c12', '#17a2b8', '#9b59b6', '#34495e']
+
+# --- 기본 색상 방향 매핑 ---
+# [설명] 각 통계 지표별로 양수일 때 어떤 색상을 사용할지 정의
+# 'green_for_positive': 양수일 때 초록색 (기본값)
+# 'red_for_positive': 양수일 때 빨간색
+DEFAULT_COLOR_DIRECTIONS = {
+    'ipc': 'green_for_positive',           # IPC는 높을수록 좋음 → 양수일 때 초록
+    'power': 'red_for_positive',           # 전력은 낮을수록 좋음 → 양수일 때 빨강
+    'L2_cache_miss_rate': 'red_for_positive',  # 캐시 미스율은 낮을수록 좋음 → 양수일 때 빨강
+    'total_power': 'red_for_positive',     # 총 전력은 낮을수록 좋음 → 양수일 때 빨강
+    'energy': 'red_for_positive',          # 에너지는 낮을수록 좋음 → 양수일 때 빨강
+    'throughput': 'green_for_positive',    # 처리량은 높을수록 좋음 → 양수일 때 초록
+    'latency': 'red_for_positive',         # 지연시간은 낮을수록 좋음 → 양수일 때 빨강
+    'bandwidth': 'green_for_positive',     # 대역폭은 높을수록 좋음 → 양수일 때 초록
+    'efficiency': 'green_for_positive',    # 효율성은 높을수록 좋음 → 양수일 때 초록
+    'utilization': 'green_for_positive',   # 사용률은 높을수록 좋음 → 양수일 때 초록
+}
 
 # --- study_out_dir 지정 (실행 인자/환경변수 우선) ---
 def get_study_out_dir():
@@ -75,112 +89,10 @@ def load_stats_to_find(stats_file='stats.txt'):
 
 STATS_TO_FIND = load_stats_to_find('stats.txt')
 KEY_VALUE_PATTERN = re.compile(r"^\s*(\S+)\s*=\s*([-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?|[Nn][Aa][Nn])")
-SUB_GROUPS = ['sub1','sub2','sub3','sub4']
-def process_single_report(report_path: Path, stats_to_find: list, group_name: str):
-    # group, subgroup, run 추출
-    run_name = report_path.parent.name
-    subgroup_name = report_path.parent.parent.name
-    for mon_test in SUB_GROUPS:
-        if mon_test in subgroup_name:
-            subgroup_name = mon_test
-    # group_name은 analyze_directory에서 전달받음
-    values_dict = {stat: [] for stat in stats_to_find}
-    matched_keys_dict = {stat: set() for stat in stats_to_find}
-    search_started = False
-    try:
-        with open(report_path, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                if not search_started:
-                    if "Running Complete" in line:
-                        search_started = True
-                    continue
-                match = KEY_VALUE_PATTERN.search(line)
-                if match:
-                    found_key, value_str = match.groups()
-                    for stat in stats_to_find:
-                        if stat in found_key:
-                            value = 0.0 if value_str.lower() == 'nan' else float(value_str)
-                            values_dict[stat].append(value)
-                            matched_keys_dict[stat].add(found_key)
-    except IOError:
-        return None
-    averages = {stat: sum(v) / len(v) for stat, v in values_dict.items() if v}
-    # matched_keys_dict: only keep those with values
-    matched_keys_dict = {stat: list(keys) for stat, keys in matched_keys_dict.items() if values_dict[stat]}
-    result = (group_name, subgroup_name, run_name, averages, matched_keys_dict) if averages else None
-    return result
 
-
-from concurrent.futures import ProcessPoolExecutor, as_completed  # 변경: 멀티프로세싱 사용
-
-def analyze_directory(root_path: Path, stats_to_find: list):
-    # [설명] 지정한 디렉토리 내 모든 결과 파일을 병렬로 분석하여 DataFrame으로 집계합니다.
-    report_files = list(root_path.rglob("*.out"))
-    if not report_files:
-        return None, {}
-    group_name = root_path.name  # baseline_dir 또는 target_dirs의 폴더명
-    results = []
-    all_matched_keys = {stat: set() for stat in stats_to_find}
-    # 캐시 적용: 파일별로 캐시 확인 및 저장
-    stats_hash = hashlib.md5(','.join(stats_to_find).encode()).hexdigest()
-    uncached_files = []
-    cache_results = {}
-    for report_path in report_files:
-        cache_key = (str(report_path.resolve()), os.path.getmtime(report_path), stats_hash)
-        cached = cache.get(cache_key, default=None)
-        if cached is not None:
-            # 캐시가 4개 tuple이면, matched_keys_dict를 빈 dict로 보정
-            if isinstance(cached, tuple) and len(cached) == 4:
-                group, subgroup, run, averages = cached
-                matched_keys_dict = {}
-                cache_results[report_path] = (group, subgroup, run, averages, matched_keys_dict)
-            else:
-                cache_results[report_path] = cached
-        else:
-            uncached_files.append(report_path)
-    # uncached_files만 멀티프로세싱으로 처리
-    if uncached_files:
-        with ProcessPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(process_single_report, file, stats_to_find, group_name) for file in uncached_files]
-            for idx, future in enumerate(as_completed(futures)):
-                result = future.result()
-                if result:
-                    # 캐시에 저장
-                    report_path = uncached_files[idx]
-                    cache_key = (str(report_path.resolve()), os.path.getmtime(report_path), stats_hash)
-                    cache.set(cache_key, result)
-                    cache_results[report_path] = result
-    # 결과 합치기
-    for report_path in report_files:
-        result = cache_results.get(report_path)
-        if result:
-            group, subgroup, run, stats, matched_keys_dict = result
-            results.append((group, subgroup, run, stats))
-            for stat, keys in matched_keys_dict.items():
-                all_matched_keys[stat].update(keys)
-    if not results:
-        return None, {stat: list(keys) for stat, keys in all_matched_keys.items()}
-    # group, subgroup, run, stat별로 DataFrame 생성
-    records = []
-    for group, subgroup, run, stats in results:
-        for stat, value in stats.items():
-            records.append({
-                'Group': group,
-                'Subgroup': subgroup,
-                'Run': run,
-                'Stat': stat,
-                'Value': value
-            })
-    df = pd.DataFrame(records)
-    if df.empty:
-        return None, {stat: list(keys) for stat, keys in all_matched_keys.items()}
-    # Subgroup prefix(앞 5글자)로 병합
-    df['SubgroupPrefix'] = df['Subgroup'].str[:5]
-    # Run은 그대로 두고, Group, SubgroupPrefix, Run, Stat별로 평균
-    df_agg = df.groupby(['Group', 'SubgroupPrefix', 'Run', 'Stat'], as_index=False)['Value'].mean()
-    df_agg = df_agg.rename(columns={'SubgroupPrefix': 'Subgroup'})
-    return df_agg, {stat: list(keys) for stat, keys in all_matched_keys.items()}
-
+def natural_key(s):
+    """자연스러운 정렬을 위한 키 함수 (run1, run2, ..., run10 순서)"""
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', str(s))]
 
 def find_subdirectories(base_path: Path, depth: int) -> list:
     # [설명] 기준 경로에서 지정한 depth까지 하위 디렉토리를 탐색해 목록을 반환합니다.
@@ -320,6 +232,18 @@ controls = dbc.Card([
             ])
         ], style={"marginBottom": "25px"}),
 
+        # Section 5: Color Direction Settings
+        html.Div([
+            html.H5("5. 🎨 Color Direction Settings", 
+                    style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            html.P("Set color direction for each stat in change tables:", 
+                   style={"fontSize": "0.9em", "color": COLORS['gray'], "marginBottom": "10px"}),
+            html.Div(id='color-direction-controls', style={"marginBottom": "10px"}),
+            dbc.Button("Apply Colors", id="apply-colors-btn", color="secondary", size="sm", className="mt-2"),
+            html.P(id='color-direction-status', 
+                   style={"fontSize": "0.9em", "color": COLORS['gray'], "marginTop": "5px"}),
+        ], style={"marginBottom": "25px"}),
+
         # Analysis Button
         dbc.Button("🚀 Start Analysis", id="run-button", 
                   color="primary", className="my-3 w-100",
@@ -423,6 +347,16 @@ app.layout = dbc.Container([
                         tab_id="absolute", label_style={"color": COLORS['primary'], "fontWeight": "600"}),
                 dbc.Tab(html.Div(id="percentage-change-tab"), label="📊 Performance Change", 
                         tab_id="change", label_style={"color": COLORS['primary'], "fontWeight": "600"}),
+                dbc.Tab(
+                    html.Div([
+                        html.H3("Detailed Run Table", className="mt-3"),
+                        dcc.Dropdown(id='detailed-group-subgroup-dropdown', options=[], placeholder="Select test group/subgroup...", style={"marginBottom": "20px"}),
+                        html.Div(id='detailed-run-table-container')
+                    ]),
+                    label="🧾 Detailed Run Table",
+                    tab_id="detailed-run-tab",
+                    label_style={"color": COLORS['primary'], "fontWeight": "600"}
+                ),
             ], style={"marginBottom": "30px"}),
             # Stores (hidden)
             dcc.Store(id='job-start-time-store'),
@@ -436,6 +370,7 @@ app.layout = dbc.Container([
             dcc.Store(id='stat-matched-keys-store'), # 추가: stat-matched-keys-store
             dcc.Store(id='analysis-complete-store'), # 분석 완료 전용 Store
             dcc.Store(id='study-out-dir-store', data=STUDY_OUT_DIR), # 추가: study_out_dir Store
+            dcc.Store(id='color-direction-store', data=DEFAULT_COLOR_DIRECTIONS), # 추가: 색상 방향 설정 Store
             # Footer
             html.Footer([
                 html.Hr(style={"borderColor": COLORS['light'], "margin": "30px 0"}),
@@ -464,113 +399,91 @@ app.layout = dbc.Container([
                            style={"color": COLORS['primary'], "fontWeight": "600"})
         ], style={"backgroundColor": COLORS['light']}),
         dbc.ModalBody([
-            html.H5("🚀 Quick Start Guide", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            html.H5("🚀 Quick Start", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
             html.Ol([
                 html.Li([
                     html.Strong("Select Baseline Directory: "),
-                    "Choose the reference directory containing your baseline simulation results (.out files)"
-                ], style={"marginBottom": "10px"}),
+                    "Choose the reference directory containing your baseline simulation results"
+                ], style={"marginBottom": "8px"}),
                 html.Li([
                     html.Strong("Select Target Directories: "),
                     "Choose one or more directories to compare against the baseline"
-                ], style={"marginBottom": "10px"}),
+                ], style={"marginBottom": "8px"}),
                 html.Li([
-                    html.Strong("Add Manual Paths (Optional): "),
+                    html.Strong("Optional: Add Manual Paths: "),
                     "Enter additional directory paths not listed in the dropdown"
-                ], style={"marginBottom": "10px"}),
+                ], style={"marginBottom": "8px"}),
                 html.Li([
                     html.Strong("Edit Stat List: "),
-                    "You can edit the stat list directly in the sidebar, or by editing stats.txt in the project folder."
-                ], style={"marginBottom": "10px"}),
+                    "Modify the list of statistics to analyze (or edit stats.txt file)"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Configure Statistical Options: "),
+                    "Enable significance testing, set α level, correction method, and effect size threshold"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Set Color Directions: "),
+                    "Choose color direction for each stat (🔴 Red for + or 🟢 Green for +) in change tables"
+                ], style={"marginBottom": "8px"}),
                 html.Li([
                     html.Strong("Start Analysis: "),
-                    "Click the button to begin processing and comparing results"
-                ], style={"marginBottom": "10px"}),
+                    "Click 'Start Analysis' to process all .out files and generate reports"
+                ], style={"marginBottom": "8px"}),
                 html.Li([
-                    html.Strong("View Results: "),
-                    "Explore absolute values and performance changes in the tabs. In the 'Performance Change' tab, you can interpret statistical significance and effect size for each metric."
-                ], style={"marginBottom": "10px"}),
-                html.Li([
-                    html.Strong("Statistical Options: "),
-                    "Use the sidebar to adjust significance level (α), multiple comparison correction, and effect size (Cohen's d) threshold."
-                ], style={"marginBottom": "10px"}),
-                html.Li([
-                    html.Strong("Save as HTML: "),
-                    "Click the 'Save as HTML' button (top right) to save the current dashboard view—including all graphs, filters, and tables—as a static HTML file. The file will be named 'dashboard_snapshot_YYYYMMDD_HHMMSS.html'. After saving, a toast notification will appear at the bottom right."
-                ], style={"marginBottom": "10px"})
-            ], style={"marginBottom": "20px"}),
-
-            html.H5("📂 Data & Environment", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
-            html.Ul([
-                html.Li([
-                    html.Strong("Analysis Root Directory: "),
-                    "You can set the analysis root directory using the environment variable STUDY_OUT_DIR. "
-                    "If not set, the current working directory is used. Example:",
-                    html.Br(),
-                    html.Code("export STUDY_OUT_DIR=/path/to/your/results", style={"fontSize": "0.95em"})
-                ], style={"marginBottom": "10px"}),
-                html.Li([
-                    html.Strong(".out File Placement: "),
-                    "Place your simulation .out files in subdirectories under the analysis root. The app will automatically discover .out files in all subdirectories up to depth 5."
-                ], style={"marginBottom": "10px"}),
-                html.Li([
-                    html.Strong("Stat List Editing: "),
-                    "Edit the stat list in the sidebar or by modifying stats.txt. Changes are reflected immediately after applying."
-                ], style={"marginBottom": "10px"}),
-                html.Li([
-                    html.Strong("Info Area: "),
-                    "When you start analysis, the info area will show the target directories and start time. When analysis completes, it will show elapsed time and cache info."
-                ], style={"marginBottom": "10px"}),
-                html.Li([
-                    html.Strong("Cache & Performance: "),
-                    "File-level caching is used for fast repeated analysis. If you have a very large/deep directory tree, initial loading may take longer."
-                ], style={"marginBottom": "10px"}),
-                html.Li([
-                    html.Strong("Footer Info: "),
-                    "The footer shows the current version, last updated date, Python/Dash/Plotly versions, and environment variable usage."
-                ], style={"marginBottom": "10px"})
+                    html.Strong("Explore Results: "),
+                    "View absolute values, performance changes, and detailed run-level data in the tabs"
+                ], style={"marginBottom": "8px"})
             ], style={"marginBottom": "20px"}),
 
             html.H5("📊 Understanding Results", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
             html.Ul([
                 html.Li([
-                    html.Strong("Absolute Values: "),
-                    "Raw performance metrics for each directory"
+                    html.Strong("Absolute Values Tab: "),
+                    "Raw performance metrics for each directory with drill-down to run-level data"
                 ], style={"marginBottom": "8px"}),
                 html.Li([
-                    html.Strong("Performance Change Table: "),
-                    "Shows the percentage change, adjusted p-value (p-adj), and effect size (Cohen's d) for each Subgroup/Stat."
+                    html.Strong("Performance Change Tab: "),
+                    "Percentage changes with statistical significance (★) and effect size (Cohen's d)"
                 ], style={"marginBottom": "8px"}),
                 html.Li([
-                    html.Strong("Statistical Significance (★): "),
-                    "If the adjusted p-value (p-adj) is less than α, a star (★) is shown next to the value, indicating a statistically significant change."
+                    html.Strong("Detailed Run Table Tab: "),
+                    "Run-by-run comparison showing absolute values and changes side by side"
                 ], style={"marginBottom": "8px"}),
                 html.Li([
-                    html.Strong("Effect Size (Cohen's d): "),
-                    "Quantifies the magnitude of the difference. Typical interpretation: d ≈ 0.2 (small), d ≈ 0.5 (medium), d ≈ 0.8+ (large)."
+                    html.Strong("Statistical Significance: "),
+                    "★ indicates statistically significant changes (p-adj < α)"
                 ], style={"marginBottom": "8px"}),
                 html.Li([
-                    html.Strong("Effect Size Threshold: "),
-                    "Use the slider to filter for changes with a minimum effect size. Only values with d above the threshold are considered practically meaningful."
+                    html.Strong("Effect Size: "),
+                    "Cohen's d: ~0.2 (small), ~0.5 (medium), ~0.8+ (large)"
                 ], style={"marginBottom": "8px"}),
                 html.Li([
                     html.Strong("Color Coding: "),
-                    "Cells are colored by the magnitude and direction of change (green/red pastel). No additional color is used for significance."
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Export: "),
-                    "You can export the table as CSV for further analysis."
+                    "Green/red pastel colors indicate improvement/regression magnitude. Customizable direction per stat"
                 ], style={"marginBottom": "8px"})
             ], style={"marginBottom": "20px"}),
 
-            html.H5("⚙️ Features", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            html.H5("⚙️ Key Features", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
             html.Ul([
-                html.Li("File-level caching for fast repeated analysis"),
-                html.Li("Export tables as CSV"),
-                html.Li("Save dashboard as HTML snapshot (current view, including all filters and graphs)"),
-                html.Li("Statistical significance (p-adj) and effect size (Cohen's d) for robust interpretation"),
-                html.Li("Responsive design for all screen sizes"),
-                html.Li("Customizable stat list via stats.txt file")
+                html.Li("Automatic .out file discovery and parsing"),
+                html.Li("Multi-processor analysis for fast processing"),
+                html.Li("Statistical significance testing with multiple comparison corrections"),
+                html.Li("Effect size analysis (Cohen's d)"),
+                html.Li("Interactive drill-down from summary to run-level data"),
+                html.Li("CSV export for all tables"),
+                html.Li("HTML snapshot saving"),
+                html.Li("Customizable stat list"),
+                html.Li("Natural sorting of run names (run1, run2, ..., run10)"),
+                html.Li("Responsive design for all screen sizes")
+            ], style={"marginBottom": "20px"}),
+
+            html.H5("💡 Tips", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            html.Ul([
+                html.Li("Use the sidebar toggle (◀/▶) to maximize viewing area"),
+                html.Li("Click on table cells to drill down to run-level details"),
+                html.Li("Adjust statistical options for more rigorous analysis"),
+                html.Li("Export tables for further analysis in external tools"),
+                html.Li("Save HTML snapshots to preserve current view with all filters")
             ])
         ]),
         dbc.ModalFooter([
@@ -896,12 +809,25 @@ def update_absolute_values_tab(summaries_json, dir_names, stats_to_find, matched
         output_components.extend([
             html.H4("Data Table", className="mt-3"),
             dash_table.DataTable(
+                id={'type': 'abs-table', 'index': i},
                 data=table_df.round(4).to_dict('records'),
                 style_table={'overflowX': 'auto'},
-                style_cell={'textAlign': 'center', 'minWidth': '80px', 'maxWidth': '100px', 'width': '90px'},
+                style_cell={
+                    'textAlign': 'center',
+                    'minWidth': '80px',
+                    'maxWidth': '220px',
+                    'width': '90px',
+                    'overflow': 'hidden',
+                    'textOverflow': 'ellipsis',
+                    'whiteSpace': 'nowrap',
+                },
                 export_format='csv',
                 export_headers='display',
+                active_cell=None,
+                row_selectable='single',
+                cell_selectable=True,
             ),
+            html.Div(id={'type': 'abs-run-drilldown', 'index': i}),
             # Stat-to-actual-key mapping summary
             html.Div([
                 html.H6("Stat-to-actual-key mapping:"),
@@ -929,22 +855,55 @@ def update_absolute_values_tab(summaries_json, dir_names, stats_to_find, matched
     return output_components
 
 # --- 파스텔톤 히트맵 색상 함수 ---
-def get_pastel_gradient_color(value, vmin, vmax):
+def get_pastel_gradient_color(value, vmin, vmax, stat_name=None, color_direction=None):
+    """
+    파스텔 그라데이션 색상을 반환합니다.
+    
+    Args:
+        value: 색상을 적용할 값
+        vmin: 최소값
+        vmax: 최대값
+        stat_name: 통계 지표 이름 (예: 'ipc', 'power')
+        color_direction: 색상 방향 ('green_for_positive' 또는 'red_for_positive')
+    
+    Returns:
+        RGB 색상 문자열
+    """
     if value is None or np.isnan(value):
         return 'white'
+    
+    # 색상 방향 결정
+    if color_direction is None and stat_name is not None:
+        color_direction = DEFAULT_COLOR_DIRECTIONS.get(stat_name, 'green_for_positive')
+    elif color_direction is None:
+        color_direction = 'green_for_positive'  # 기본값
+    
     max_abs = max(abs(vmin), abs(vmax), 1e-6)
     ratio = min(abs(value) / max_abs, 1)
+    
     if value > 0:
-        # 나뭇잎 진녹색 파스텔: 밝은 연녹색(220,240,220) ~ 진녹색(60,180,90)
-        r = int(220 - (160 * ratio))  # 220~60
-        g = int(240 - (60 * ratio))   # 240~180
-        b = int(220 - (130 * ratio))  # 220~90
+        if color_direction == 'green_for_positive':
+            # 양수일 때 초록색 (기본): 나뭇잎 진녹색 파스텔
+            r = int(220 - (160 * ratio))  # 220~60
+            g = int(240 - (60 * ratio))   # 240~180
+            b = int(220 - (130 * ratio))  # 220~90
+        else:  # red_for_positive
+            # 양수일 때 빨간색: 붉은 파스텔
+            r = 255
+            g = int(220 - (120 * ratio))  # 220~100
+            b = int(220 - (120 * ratio))  # 220~100
         return f'rgb({r},{g},{b})'
     elif value < 0:
-        # 붉은 파스텔: 밝은 연분홍(255,220,220) ~ 진빨강(255,100,100)
-        r = 255
-        g = int(220 - (120 * ratio))  # 220~100
-        b = int(220 - (120 * ratio))  # 220~100
+        if color_direction == 'green_for_positive':
+            # 음수일 때 빨간색 (기본): 붉은 파스텔
+            r = 255
+            g = int(220 - (120 * ratio))  # 220~100
+            b = int(220 - (120 * ratio))  # 220~100
+        else:  # red_for_positive
+            # 음수일 때 초록색: 나뭇잎 진녹색 파스텔
+            r = int(220 - (160 * ratio))  # 220~60
+            g = int(240 - (60 * ratio))   # 240~180
+            b = int(220 - (130 * ratio))  # 220~90
         return f'rgb({r},{g},{b})'
     else:
         return 'white'
@@ -957,9 +916,10 @@ def get_pastel_gradient_color(value, vmin, vmax):
      State("effect-size-threshold-slider", "value"),
      State('stats-store', 'data'),
      State('stat-matched-keys-store', 'data'),
-     State('enable-statistical-options', 'value')]
+     State('enable-statistical-options', 'value'),
+     State('color-direction-store', 'data')]
 )
-def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_threshold, stats_to_find, matched_keys, enable_statistical_options):
+def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_threshold, stats_to_find, matched_keys, enable_statistical_options, color_directions):
     output_components = []
     if change_dfs_json is None:
         output_components.append("Please start analysis or wait for it to complete.")
@@ -1008,7 +968,7 @@ def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_
             vmin = table_df[stat_col].min()
             vmax = table_df[stat_col].max()
             for irow, row in table_df.iterrows():
-                color = get_pastel_gradient_color(row[stat_col], vmin, vmax)
+                color = get_pastel_gradient_color(row[stat_col], vmin, vmax, stat, color_directions[stat])
                 style_data_conditional.append({
                     'if': {'row_index': irow, 'column_id': stat_col},
                     'backgroundColor': color,
@@ -1104,9 +1064,10 @@ def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_
     State({'type': 'change-table', 'index': MATCH}, 'data'),
     State('run-change-data-store', 'data'),
     State('dir-names-store', 'data'),
+    State('color-direction-store', 'data'),
     prevent_initial_call=True,
 )
-def show_run_level_table(active_cell, table_data, run_change_dfs_json, dir_names):
+def show_run_level_table(active_cell, table_data, run_change_dfs_json, dir_names, color_directions):
     if not active_cell or not table_data or not run_change_dfs_json:
         return []
     row = table_data[active_cell['row']]
@@ -1125,6 +1086,8 @@ def show_run_level_table(active_cell, table_data, run_change_dfs_json, dir_names
         return html.P("No run-level data for this subgroup.")
     # wide format: Run, stat1, stat2, ...
     pivot_df = run_df.pivot_table(index='Run', columns='Stat', values='Change', aggfunc='mean').reset_index().round(2)
+    # Run 자연스러운 오름차순 정렬
+    pivot_df = pivot_df.sort_values('Run', key=lambda x: x.map(natural_key)).reset_index(drop=True)
     # 파스텔톤 히트맵 적용
     stat_cols = [col for col in pivot_df.columns if col != 'Run']
     style_data_conditional = []
@@ -1132,7 +1095,7 @@ def show_run_level_table(active_cell, table_data, run_change_dfs_json, dir_names
         vmin = pivot_df[stat].min()
         vmax = pivot_df[stat].max()
         for irow, row in pivot_df.iterrows():
-            color = get_pastel_gradient_color(row[stat], vmin, vmax)
+            color = get_pastel_gradient_color(row[stat], vmin, vmax, stat, color_directions[stat])
             style_data_conditional.append({
                 'if': {'row_index': irow, 'column_id': stat},
                 'backgroundColor': color,
@@ -1323,12 +1286,18 @@ def toggle_sidebar(n_clicks, is_open):
     prevent_initial_call=True,
 )
 def update_dir_options(n_clicks, study_out_dir):
-    import os
-    if not study_out_dir or not os.path.isdir(study_out_dir):
-        return [], [], f"❌ Directory not found: {study_out_dir}", dash.no_update
-    discovered_dirs = find_subdirectories(Path(study_out_dir), depth=2)
-    dir_options = [{'label': os.path.basename(p), 'value': p} for p in discovered_dirs]
-    return dir_options, dir_options, f"✅ Directory loaded: {study_out_dir}", study_out_dir
+    if not n_clicks:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    
+    if not study_out_dir:
+        return dash.no_update, dash.no_update, "Please enter a valid directory path.", dash.no_update
+    
+    try:
+        discovered_dirs = find_subdirectories(Path(study_out_dir), depth=2)
+        dir_options = [{'label': os.path.basename(p), 'value': p} for p in discovered_dirs]
+        return dir_options, dir_options, f"✅ Found {len(discovered_dirs)} directories in {study_out_dir}", study_out_dir
+    except Exception as e:
+        return dash.no_update, dash.no_update, f"❌ Error: {str(e)}", dash.no_update
 
 # 캐시 상태 확인 함수
 def get_cache_info():
@@ -1400,45 +1369,60 @@ def analyze_directory(root_path: Path, stats_to_find: list):
     if not report_files:
         return None, {}
     group_name = root_path.name
-    subgroups = SUB_GROUPS  # 이미 정의되어 있다고 가정
+    subgroups = ['sub1','sub2','sub3','sub4']  # 하드코딩된 subgroups
     offsets_dict = build_all_offsets(report_files, stats_to_find, subgroups)
     results = []
     all_matched_keys = {stat: set() for stat in stats_to_find}
-    stats_hash = hashlib.md5(','.join(stats_to_find).encode()).hexdigest()
-    uncached_files = []
-    cache_results = {}
-    for report_path in report_files:
-        cache_key = (str(report_path.resolve()), os.path.getmtime(report_path), stats_hash)
-        cached = cache.get(cache_key, default=None)
-        if cached is not None:
-            if isinstance(cached, tuple) and len(cached) == 4:
-                group, subgroup, run, averages = cached
-                matched_keys_dict = {}
-                cache_results[report_path] = (group, subgroup, run, averages, matched_keys_dict)
-            else:
-                cache_results[report_path] = cached
-        else:
-            uncached_files.append(report_path)
-    if uncached_files:
-        with ProcessPoolExecutor(max_workers=8) as executor:
-            futures = [
-                executor.submit(process_single_report_mmap, file, stats_to_find, group_name, offsets_dict, subgroups)
-                for file in uncached_files
-            ]
-            for idx, future in enumerate(as_completed(futures)):
-                result = future.result()
-                if result:
-                    report_path = uncached_files[idx]
-                    cache_key = (str(report_path.resolve()), os.path.getmtime(report_path), stats_hash)
-                    cache.set(cache_key, result)
-                    cache_results[report_path] = result
-    for report_path in report_files:
-        result = cache_results.get(report_path)
-        if result:
-            group, subgroup, run, stats, matched_keys_dict = result
-            results.append((group, subgroup, run, stats))
-            for stat, keys in matched_keys_dict.items():
-                all_matched_keys[stat].update(keys)
+    # stats_hash = hashlib.md5(','.join(stats_to_find).encode()).hexdigest()
+    # uncached_files = []
+    # cache_results = {}
+    # for report_path in report_files:
+    #     cache_key = (str(report_path.resolve()), os.path.getmtime(report_path), stats_hash)
+    #     cached = cache.get(cache_key, default=None)
+    #     if cached is not None:
+    #         if isinstance(cached, tuple) and len(cached) == 4:
+    #             group, subgroup, run, averages = cached
+    #             matched_keys_dict = {}
+    #             cache_results[report_path] = (group, subgroup, run, averages, matched_keys_dict)
+    #         else:
+    #             cache_results[report_path] = cached
+    #     else:
+    #         uncached_files.append(report_path)
+    # if uncached_files:
+    #     with ProcessPoolExecutor(max_workers=8) as executor:
+    #         futures = [
+    #             executor.submit(process_single_report_mmap, file, stats_to_find, group_name, offsets_dict, subgroups)
+    #             for file in uncached_files
+    #         ]
+    #         for idx, future in enumerate(as_completed(futures)):
+    #             result = future.result()
+    #             if result:
+    #                 report_path = uncached_files[idx]
+    #                 cache_key = (str(report_path.resolve()), os.path.getmtime(report_path), stats_hash)
+    #                 cache.set(cache_key, result)
+    #                 cache_results[report_path] = result
+    # for report_path in report_files:
+    #     result = cache_results.get(report_path)
+    #     if result:
+    #         group, subgroup, run, stats, matched_keys_dict = result
+    #         results.append((group, subgroup, run, stats))
+    #         for stat, keys in matched_keys_dict.items():
+    #             all_matched_keys[stat].update(keys)
+    
+    # 캐시 비활성화: 모든 파일을 새로 처리
+    with ProcessPoolExecutor(max_workers=8) as executor:
+        futures = [
+            executor.submit(process_single_report_mmap, file, stats_to_find, group_name, offsets_dict, subgroups)
+            for file in report_files
+        ]
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                group, subgroup, run, stats, matched_keys_dict = result
+                results.append((group, subgroup, run, stats))
+                for stat, keys in matched_keys_dict.items():
+                    all_matched_keys[stat].update(keys)
+    
     if not results:
         return None, {stat: list(keys) for stat, keys in all_matched_keys.items()}
     records = []
@@ -1487,6 +1471,7 @@ def parse_file_with_offsets(file_path, offsets, stats_to_find):
     return: {stat: value}
     """
     results = {}
+    failed_stats = set()
     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         mm.seek(0)
@@ -1499,6 +1484,7 @@ def parse_file_with_offsets(file_path, offsets, stats_to_find):
         for stat in stats_to_find:
             offset = offsets.get(stat)
             if offset is None:
+                failed_stats.add(stat)
                 continue
             mm.seek(pos)
             mm.readline()  # Running Complete 라인
@@ -1509,33 +1495,336 @@ def parse_file_with_offsets(file_path, offsets, stats_to_find):
             if match:
                 _, value_str = match.groups()
                 results[stat] = float(value_str) if value_str.lower() != 'nan' else 0.0
+            else:
+                failed_stats.add(stat)
         mm.close()
-    return results
-import mmap
-
-def fast_stat_parse(file_path, stats_to_find):
-    results = {}
-    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-        for stat in stats_to_find:
-            pos = mm.find(stat.encode('utf-8'))
-            if pos == -1:
-                continue
-            # stat이 포함된 라인으로 이동
-            mm.seek(pos)
-            # 라인 시작으로 이동
-            while mm.tell() > 0:
-                mm.seek(mm.tell() - 1)
-                if mm.read(1) == b'\n':
+    # Fallback: offset 방식에서 못 찾은 stat은 line by line으로 찾기
+    if failed_stats:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            search_started = False
+            for line in f:
+                if not search_started:
+                    if "Running Complete" in line:
+                        search_started = True
+                    continue
+                match = KEY_VALUE_PATTERN.search(line)
+                if match:
+                    found_key, value_str = match.groups()
+                    for stat in failed_stats.copy():
+                        if stat in found_key:
+                            results[stat] = 0.0 if value_str.lower() == 'nan' else float(value_str)
+                            failed_stats.remove(stat)
+                if not failed_stats:
                     break
-                mm.seek(mm.tell() - 1)
-            line = mm.readline().decode('utf-8', errors='ignore')
-            match = KEY_VALUE_PATTERN.search(line)
-            if match:
-                _, value_str = match.groups()
-                results[stat] = float(value_str) if value_str.lower() != 'nan' else 0.0
-        mm.close()
     return results
+
+# [드릴다운] 절대값 분석 테이블 셀 클릭 시 run별 절대값 테이블 표시
+@app.callback(
+    Output({'type': 'abs-run-drilldown', 'index': MATCH}, 'children'),
+    Input({'type': 'abs-table', 'index': MATCH}, 'active_cell'),
+    State({'type': 'abs-table', 'index': MATCH}, 'data'),
+    State('summary-data-store', 'data'),
+    State('dir-names-store', 'data'),
+    State('stats-store', 'data'),
+    State('color-direction-store', 'data'),
+    prevent_initial_call=True,
+)
+def show_abs_run_level_table(active_cell, table_data, summaries_json, dir_names, stats_to_find, color_directions):
+    if not active_cell or not table_data or not summaries_json or not dir_names:
+        return []
+    row = table_data[active_cell['row']]
+    col_id = active_cell['column_id']
+    # column_id가 dict일 경우 str로 변환
+    if isinstance(col_id, dict):
+        col_id = col_id.get('id', '')
+    subgroup = row.get('Subgroup')
+    # mean 행 클릭 시 무시
+    if not subgroup or subgroup == 'mean':
+        return []
+    # triggered prop_id에서 index 안전 추출
+    ctx = dash.callback_context
+    idx = None
+    try:
+        prop_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        if 'index' in prop_id:
+            idx = int(eval(prop_id)['index'])
+    except Exception:
+        idx = 0
+    if idx is None or idx >= len(summaries_json):
+        return []
+    summary_json = summaries_json[idx]
+    if not summary_json:
+        return []
+    summary_df = pd.read_json(summary_json, orient='split')
+    # run별, stat별 wide format
+    if {'Subgroup', 'Run', 'Stat', 'Value'}.issubset(summary_df.columns):
+        run_df = summary_df[summary_df['Subgroup'] == subgroup]
+        if run_df.empty:
+            return html.P("No run-level data for this subgroup.")
+        pivot_df = run_df.pivot_table(index='Run', columns='Stat', values='Value', aggfunc='mean').reset_index().round(4)
+        # stat-list 기준 컬럼 보장
+        for stat in stats_to_find:
+            if stat not in pivot_df.columns:
+                pivot_df[stat] = np.nan
+        pivot_df = pivot_df[['Run'] + stats_to_find]
+        # Run 자연스러운 오름차순 정렬
+        pivot_df = pivot_df.sort_values('Run', key=lambda x: x.map(natural_key)).reset_index(drop=True)
+        # 평균 행 추가
+        min_row = {'Run': 'mean'}
+        for stat in stats_to_find:
+            min_row[stat] = pivot_df[stat].mean()
+        pivot_df = pd.concat([pivot_df, pd.DataFrame([min_row])], ignore_index=True)
+        return dash_table.DataTable(
+            data=pivot_df.round(4).to_dict('records'),
+            columns=[{"name": c, "id": c} for c in pivot_df.columns],
+            style_table={'overflowX': 'auto'},
+            style_cell={
+                'textAlign': 'center',
+                'minWidth': '80px',
+                'maxWidth': '220px',
+                'width': '90px',
+                'overflow': 'hidden',
+                'textOverflow': 'ellipsis',
+                'whiteSpace': 'nowrap',
+            },
+            page_size=20,
+            export_format='csv',
+            export_headers='display',
+        )
+    return html.P("No run-level data for this subgroup.")
+
+# --- 새로운 탭: Detailed Run Table ---
+
+detailed_tab_id = 'detailed-run-tab'
+
+def get_group_subgroup_options(summaries_json, dir_names):
+    # summaries_json: [baseline, target1, ...]
+    # dir_names: [baseline, target1, ...]
+    options = []
+    if not summaries_json or not dir_names:
+        return options
+    for i, summary_json in enumerate(summaries_json):
+        if not summary_json:
+            continue
+        df = pd.read_json(summary_json, orient='split')
+        if {'Group', 'Subgroup'}.issubset(df.columns):
+            for _, row in df[['Group', 'Subgroup']].drop_duplicates().iterrows():
+                label = f"{row['Group']} / {row['Subgroup']}"
+                value = f"{i}|||{row['Group']}|||{row['Subgroup']}"
+                options.append({'label': label, 'value': value})
+    return options
+
+@app.callback(
+    Output('detailed-group-subgroup-dropdown', 'options'),
+    [Input('summary-data-store', 'data'), State('dir-names-store', 'data')]
+)
+def update_detailed_group_subgroup_options(summaries_json, dir_names):
+    return get_group_subgroup_options(summaries_json, dir_names)
+
+@app.callback(
+    Output('detailed-run-table-container', 'children'),
+    [Input('detailed-group-subgroup-dropdown', 'value'),
+     State('summary-data-store', 'data'),
+     State('run-change-data-store', 'data'),
+     State('dir-names-store', 'data'),
+     State('stats-store', 'data'),
+     State('color-direction-store', 'data')]
+)
+def update_detailed_run_table(selected_value, summaries_json, run_change_dfs_json, dir_names, stats_to_find, color_directions):
+    if not selected_value or not summaries_json or not dir_names or not stats_to_find:
+        return "Please select a group/subgroup."
+    # value: "i|||Group|||Subgroup"
+    i, group, subgroup = selected_value.split('|||')
+    i = int(i)
+    summary_json = summaries_json[i]
+    if not summary_json:
+        return "No data."
+    summary_df = pd.read_json(summary_json, orient='split')
+    # 해당 group/subgroup의 run별 데이터
+    run_df = summary_df[(summary_df['Group'] == group) & (summary_df['Subgroup'] == subgroup)]
+    if run_df.empty:
+        return "No run-level data for this group/subgroup."
+    # run별, stat별 절대값
+    abs_pivot = run_df.pivot_table(index='Run', columns='Stat', values='Value', aggfunc='mean').reset_index()
+    # Run 자연스러운 오름차순 정렬
+    abs_pivot = abs_pivot.sort_values('Run', key=lambda x: x.map(natural_key)).reset_index(drop=True)
+    
+    # run_change_data_store에서 해당 group/subgroup의 run별 변화량 데이터 가져오기
+    change_pivot = None
+    if run_change_dfs_json and i > 0 and i-1 < len(run_change_dfs_json) and run_change_dfs_json[i-1]:
+        run_change_df = pd.read_json(run_change_dfs_json[i-1], orient='split')
+        # 해당 subgroup의 run별 변화량 데이터 필터링
+        subgroup_change_df = run_change_df[run_change_df['Subgroup'] == subgroup]
+        if not subgroup_change_df.empty:
+            # run별, stat별 변화량 pivot
+            change_pivot = subgroup_change_df.pivot_table(index='Run', columns='Stat', values='Change', aggfunc='mean').reset_index()
+            change_pivot = change_pivot.sort_values('Run', key=lambda x: x.map(natural_key)).reset_index(drop=True)
+    
+    # baseline 비교를 위해 baseline summary도 준비 (run별 변화량이 없을 때 사용)
+    baseline_df = None
+    if i != 0 and summaries_json[0]:
+        baseline_df = pd.read_json(summaries_json[0], orient='split')
+    
+    # 변화량 계산
+    if change_pivot is not None:
+        # run_change_data_store에서 가져온 변화량 사용
+        merged = abs_pivot.merge(change_pivot, on='Run', how='left', suffixes=('', '_Change'))
+        # 컬럼명 정리
+        for stat in stats_to_find:
+            if f'{stat}_Change' in merged.columns:
+                merged[f'{stat}_Change'] = merged[f'{stat}_Change']
+            else:
+                merged[f'{stat}_Change'] = np.nan
+        abs_pivot = merged
+    elif baseline_df is not None:
+        # baseline과 직접 계산
+        base_df = baseline_df[(baseline_df['Group'] == group) & (baseline_df['Subgroup'] == subgroup)]
+        if not base_df.empty:
+            base_pivot = base_df.pivot_table(index='Run', columns='Stat', values='Value', aggfunc='mean').reset_index()
+            base_pivot = base_pivot.sort_values('Run', key=lambda x: x.map(natural_key)).reset_index(drop=True)
+            # run 이름 기준 merge (left: target, right: baseline)
+            merged = abs_pivot.merge(base_pivot, on='Run', how='left', suffixes=('', '_baseline'))
+            # 변화량 계산
+            for stat in stats_to_find:
+                merged[f'{stat}_Change'] = np.nan  # 기본값
+                for idx, row in merged.iterrows():
+                    target_val = row.get(stat)
+                    baseline_val = row.get(f'{stat}_baseline')
+                    if pd.notna(target_val) and pd.notna(baseline_val) and baseline_val != 0:
+                        merged.at[idx, f'{stat}_Change'] = ((target_val - baseline_val) / baseline_val) * 100
+            abs_pivot = merged  # 이후 열 가공에 사용
+        else:
+            # baseline에 해당 group/subgroup이 없으면 모든 변화량을 NaN으로
+            for stat in stats_to_find:
+                abs_pivot[f'{stat}_Change'] = np.nan
+    else:
+        # baseline이 없으면 모든 변화량을 NaN으로
+        for stat in stats_to_find:
+            abs_pivot[f'{stat}_Change'] = np.nan
+    # columns: Run, stat1_Absolute, stat1_Change, stat2_Absolute, stat2_Change, ...
+    columns = [{'name': 'Run', 'id': 'Run'}]
+    data = []
+    for stat in stats_to_find:
+        columns.append({'name': [stat, 'Absolute'], 'id': stat})
+        columns.append({'name': [stat, 'Change(%)'], 'id': f'{stat}_Change'})
+    # 데이터 가공
+    for _, row in abs_pivot.iterrows():
+        d = {'Run': row['Run']}
+        for stat in stats_to_find:
+            val = row.get(stat, np.nan)
+            chg_col = f'{stat}_Change'
+            chg = row.get(chg_col, np.nan) if chg_col in abs_pivot.columns else np.nan
+            d[stat] = round(val, 2) if pd.notna(val) else val
+            d[chg_col] = round(chg, 2) if pd.notna(chg) else chg
+        data.append(d)
+    # 변화량 cell에만 히트맵 적용
+    style_data_conditional = []
+    for stat in stats_to_find:
+        col = f'{stat}_Change'
+        if col in abs_pivot.columns:
+            vmin = abs_pivot[col].min()
+            vmax = abs_pivot[col].max()
+            for irow, prow in abs_pivot.iterrows():
+                val = prow.get(col, None)
+                color_direction = color_directions.get(stat, 'green_for_positive') if color_directions else 'green_for_positive'
+                color = get_pastel_gradient_color(val, vmin, vmax, stat, color_direction) if vmin is not None and vmax is not None else 'white'
+                style_data_conditional.append({
+                    'if': {'row_index': irow, 'column_id': col},
+                    'backgroundColor': color,
+                    'color': 'black'
+                })
+    return dash_table.DataTable(
+        data=data,
+        columns=columns,
+        style_table={'overflowX': 'auto'},
+        style_cell={
+            'textAlign': 'center',
+            'minWidth': '80px',
+            'maxWidth': '220px',
+            'width': '90px',
+            'overflow': 'hidden',
+            'textOverflow': 'ellipsis',
+            'whiteSpace': 'nowrap',
+        },
+        style_data_conditional=style_data_conditional,
+        merge_duplicate_headers=True,
+        export_format='csv',
+        export_headers='display',
+    )
+
+# 색상 방향 설정을 위한 콜백 함수들
+@app.callback(
+    Output('color-direction-controls', 'children'),
+    Input('stats-store', 'data')
+)
+def update_color_direction_controls(stats_to_find):
+    """통계 지표 목록에 따라 색상 방향 설정 컨트롤을 동적으로 생성"""
+    if not stats_to_find:
+        return []
+    
+    controls = []
+    for stat in stats_to_find:
+        default_direction = DEFAULT_COLOR_DIRECTIONS.get(stat, 'green_for_positive')
+        controls.append(
+            html.Div([
+                html.Label(f"{stat}:", style={"fontWeight": "600", "marginBottom": "5px"}),
+                dcc.RadioItems(
+                    id={'type': 'color-direction', 'stat': stat},
+                    options=[
+                        {'label': '🔴 Red for +', 'value': 'red_for_positive'},
+                        {'label': '🟢 Green for +', 'value': 'green_for_positive'}
+                    ],
+                    value=default_direction,
+                    inline=True,
+                    style={"fontSize": "0.9em"}
+                )
+            ], style={"marginBottom": "10px"})
+        )
+    return controls
+
+@app.callback(
+    [Output('color-direction-store', 'data'),
+     Output('color-direction-status', 'children')],
+    [Input('apply-colors-btn', 'n_clicks')] + 
+    [Input({'type': 'color-direction', 'stat': ALL}, 'value')],
+    [State({'type': 'color-direction', 'stat': ALL}, 'id'),
+     State('stats-store', 'data')],
+    prevent_initial_call=True
+)
+def update_color_directions(n_clicks, color_values, color_ids, stats_to_find):
+    """색상 방향 설정을 저장하고 상태를 업데이트"""
+    if not n_clicks or not stats_to_find:
+        return dash.no_update, dash.no_update
+    
+    # 새로운 색상 방향 설정 구성
+    new_color_directions = DEFAULT_COLOR_DIRECTIONS.copy()
+    
+    # 각 통계 지표의 색상 방향 업데이트
+    for i, color_id in enumerate(color_ids):
+        if i < len(color_values) and color_values[i]:
+            stat_name = color_id['stat']
+            new_color_directions[stat_name] = color_values[i]
+    
+    # stats_to_find에 있는 모든 지표에 대해 기본값 설정
+    for stat in stats_to_find:
+        if stat not in new_color_directions:
+            new_color_directions[stat] = 'green_for_positive'
+    
+    return new_color_directions, f"✅ Color directions updated for {len(stats_to_find)} stats"
+
+def split_by_last_dot(text):
+    """마지막 . 을 기준으로 텍스트를 분리합니다."""
+    if '.' not in text:
+        return "", text
+    
+    # 마지막 . 의 위치를 찾습니다
+    last_dot_index = text.rfind('.')
+    
+    # 마지막 . 을 기준으로 앞뒤를 분리합니다
+    prefix = text[:last_dot_index]
+    suffix = text[last_dot_index + 1:]  # +1로 . 을 제거합니다
+    
+    return prefix, suffix
 
 if __name__ == "__main__":
     app.run(debug=False)
