@@ -1,0 +1,63 @@
+{
+  "weights": {
+    "sub1": {
+      "run1": 1.0,
+      "run2": 1.2,
+      "run3": 0.8,
+      "run4": 1.1,
+      "run5": 0.9,
+      "run6": 1.0,
+      "run7": 1.3,
+      "run8": 0.7,
+      "run9": 1.0,
+      "run10": 1.1
+    },
+    "sub2": {
+      "run1": 1.0,
+      "run2": 0.9,
+      "run3": 1.1,
+      "run4": 1.0,
+      "run5": 1.2,
+      "run6": 0.8,
+      "run7": 1.0,
+      "run8": 1.1,
+      "run9": 0.9,
+      "run10": 1.0
+    },
+    "sub3": {
+      "run1": 1.0,
+      "run2": 1.0,
+      "run3": 1.0,
+      "run4": 1.0,
+      "run5": 1.0,
+      "run6": 1.0,
+      "run7": 1.0,
+      "run8": 1.0,
+      "run9": 1.0,
+      "run10": 1.0
+    },
+    "sub4": {
+      "run1": 1.0,
+      "run2": 1.0,
+      "run3": 1.0,
+      "run4": 1.0,
+      "run5": 1.0,
+      "run6": 1.0,
+      "run7": 1.0,
+      "run8": 1.0,
+      "run9": 1.0,
+      "run10": 1.0
+    }
+  },
+  "description": {
+    "sub1": "High priority sub - some runs are more important",
+    "sub2": "Balanced sub - slight variations in importance",
+    "sub3": "Standard sub - all runs equally weighted",
+    "sub4": "Default sub - no special weighting"
+  },
+  "notes": {
+    "weight_meaning": "Higher weights = more influence on average calculation",
+    "default_weight": "1.0 for any file not specified",
+    "example": "run2 with weight 1.2 means 20% more influence than default"
+  }
+}

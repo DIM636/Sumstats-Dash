@@ -22,6 +22,8 @@ from statsmodels.stats.multitest import multipletests
 import argparse
 import hashlib
 import mmap
+from io import StringIO
+import json
 
 # --- 컬러 팔레트 정의 ---
 # [설명] 일관된 브랜드 컬러와 시각적 계층구조를 위한 컬러 팔레트
@@ -357,6 +359,24 @@ app.layout = dbc.Container([
                     tab_id="detailed-run-tab",
                     label_style={"color": COLORS['primary'], "fontWeight": "600"}
                 ),
+                dbc.Tab(
+                    html.Div([
+                        html.H3("Stat Comparison", className="mt-3"),
+                        html.Div([
+                            html.Label("Select Groups:", style={"fontWeight": "600", "marginBottom": "5px"}),
+                            html.Div([
+                                html.P("Choose one or more groups to compare all stats:", style={"fontSize": "0.9em", "color": COLORS['gray'], "marginBottom": "8px"}),
+                                dcc.Checklist(id='group-comparison-checklist', options=[], 
+                                             labelClassName="me-3", inputClassName="me-1",
+                                             style={"color": COLORS['dark']})
+                            ], style={"marginBottom": "15px"})
+                        ]),
+                        html.Div(id='stat-comparison-table-container')
+                    ]),
+                    label="📊 Stat Comparison",
+                    tab_id="stat-comparison-tab",
+                    label_style={"color": COLORS['primary'], "fontWeight": "600"}
+                ),
             ], style={"marginBottom": "30px"}),
             # Stores (hidden)
             dcc.Store(id='job-start-time-store'),
@@ -581,26 +601,493 @@ def update_stats_list(apply_n, reset_n, stat_text):
         return "❌ Please enter at least one stat.", stat_text, dash.no_update
     return f"✅ Stat list updated: {', '.join(stats)}", '\n'.join(stats), stats
 
-# stats-store 변경 시 Baseline Directory stat 리스트 동적 업데이트 콜백
+STATS_TO_FIND = load_stats_to_find('stats.txt')
+KEY_VALUE_PATTERN = re.compile(r"^\s*(\S+)\s*=\s*([-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?|[Nn][Aa][Nn])")
+
+def natural_key(s):
+    """자연스러운 정렬을 위한 키 함수 (run1, run2, ..., run10 순서)"""
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', str(s))]
+
+def find_subdirectories(base_path: Path, depth: int) -> list:
+    # [설명] 기준 경로에서 지정한 depth까지 하위 디렉토리를 탐색해 목록을 반환합니다.
+    dirs = set()
+    if not base_path.is_dir(): return []
+    with os.scandir(base_path) as it:
+        for entry in it:
+            if entry.is_dir():
+                dirs.add(str(Path(entry.path).resolve()))
+                if depth > 1:
+                    try:
+                        with os.scandir(entry.path) as sub_it:
+                            for sub_entry in sub_it:
+                                if sub_entry.is_dir():
+                                    dirs.add(str(Path(sub_entry.path).resolve()))
+                    except PermissionError:
+                        continue
+    return sorted(list(dirs))
+
+# --- Dash 앱 구성 ---
+# [설명] Dash 앱 객체, 서버, 타이틀, 외부 스타일, 백그라운드 콜백 매니저 등을 설정합니다.
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY], background_callback_manager=background_callback_manager)
+server = app.server
+app.title = "Monaco Simulation Analyzer"
+discovered_dirs = find_subdirectories(Path(STUDY_OUT_DIR), depth=5)
+dir_options = [{'label': os.path.basename(p), 'value': p} for p in discovered_dirs]
+
+# 1. 사이드바 controls에 stat 목록 편집 UI 추가
+controls = dbc.Card([
+    dbc.CardHeader([
+        html.H4("📊 Analysis Configuration", className="card-title mb-0", 
+                style={"color": COLORS['primary'], "fontWeight": "600"})
+    ], style={"backgroundColor": COLORS['light'], "borderBottom": f"3px solid {COLORS['secondary']}"}),
+    dbc.CardBody([
+        # study_out_dir 입력 및 Search 버튼
+        html.Div([
+            html.H5("Study Output Directory", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "10px"}),
+            dcc.Input(id='study-out-dir-input', type='text', value=STUDY_OUT_DIR, style={"width": "80%", "marginRight": "8px"}),
+            dbc.Button("Search", id="study-out-dir-search-btn", color="secondary", size="sm"),
+            html.P(id='study-out-dir-status', style={"fontSize": "0.95em", "color": COLORS['gray'], "marginTop": "5px"}),
+        ], style={"marginBottom": "18px"}),
+        # stat 목록 편집
+        html.Div([
+            html.H5("Edit Stat List", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "10px"}),
+            dcc.Textarea(id='stat-list-input', value='\n'.join(STATS_TO_FIND), style={"width": "100%", "height": "80px", "borderColor": COLORS['secondary']}),
+            dbc.Button("Apply", id="stat-list-apply-btn", color="secondary", size="sm", className="mt-2 me-2"),
+            dbc.Button("Reset to Default", id="stat-list-reset-btn", color="light", size="sm", className="mt-2"),
+            html.P(id='stat-list-status', style={"fontSize": "0.95em", "color": COLORS['gray'], "marginTop": "5px"}),
+        ], style={"marginBottom": "18px"}),
+        # Section 1: Baseline Directory
+        html.Div([
+            html.H5("1. Select Baseline Directory", 
+                    style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            html.Div([
+                html.P("This tool analyzes the following stats:", 
+                       style={"fontWeight": "600", "color": COLORS['dark'], "marginBottom": "10px"}),
+                html.Ul(id='baseline-stats-list', children=[html.Li(stat, style={"color": COLORS['dark'], "marginBottom": "5px"}) for stat in STATS_TO_FIND], 
+                       style={"backgroundColor": COLORS['light'], "padding": "10px", "borderRadius": "5px"}),
+                html.P("Click 'Start Analysis' to automatically aggregate and compare the above stats for the selected directories.", 
+                       style={"fontSize": "0.95em", "color": COLORS['gray'], "fontStyle": "italic"})
+            ], className="mb-4"),
+            dcc.Dropdown(id='baseline-dropdown', options=dir_options, 
+                        placeholder="Select the baseline directory...",
+                        style={"borderColor": COLORS['secondary']})
+        ], style={"marginBottom": "25px"}),
+        
+        # Section 2: Target Directories
+        html.Div([
+            html.H5("2. Select Target Directories", 
+                    style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            dcc.Checklist(id='target-checklist', options=dir_options, 
+                         labelClassName="me-3", inputClassName="me-1",
+                         style={"color": COLORS['dark']})
+        ], style={"marginBottom": "25px"}),
+        
+        # Section 3: Manual Paths
+        html.Div([
+            html.H5("3. (Optional) Add Directories Manually", 
+                    style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            dbc.Textarea(id="manual-path-input", 
+                        placeholder="Enter directory paths not listed above, one per line...", 
+                        style={'height': '80px', "borderColor": COLORS['secondary']})
+        ], style={"marginBottom": "25px"}),
+
+        # Section 4: Statistical Test Options
+        html.Div([
+            html.H5("4. Statistical Test Options", 
+                    style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            # 추가: 통계 옵션 활성화 체크박스
+            dbc.Checkbox(
+                id='enable-statistical-options',
+                value=False,
+                label="Enable statistical test & effect size analysis",
+                style={"marginBottom": "10px", "fontWeight": "600", "color": COLORS['secondary']}
+            ),
+            html.Div([
+                html.Label("Significance Level (α):", style={"fontWeight": "600", "marginRight": "10px"}),
+                dcc.Slider(
+                    id='alpha-slider',
+                    min=0.01, max=0.2, step=0.01, value=0.05,
+                    marks={0.01: '0.01', 0.05: '0.05', 0.1: '0.1', 0.2: '0.2'},
+                    tooltip={"placement": "bottom", "always_visible": False},
+                    included=False,
+                    updatemode='drag',
+                    className="mb-2",
+                    disabled=True  # 기본 비활성화
+                ),
+            ], style={"marginBottom": "18px"}),
+            html.Div([
+                html.Label("Multiple Comparison Correction:", style={"fontWeight": "600", "marginRight": "10px"}),
+                dcc.Dropdown(
+                    id='correction-method-dropdown',
+                    options=[
+                        {"label": "None", "value": "none"},
+                        {"label": "Bonferroni", "value": "bonferroni"},
+                        {"label": "Holm", "value": "holm"},
+                        {"label": "Benjamini-Hochberg (FDR)", "value": "fdr_bh"}
+                    ],
+                    value="none",
+                    clearable=False,
+                    style={"width": "70%"},
+                    disabled=True  # 기본 비활성화
+                )
+            ], style={"marginBottom": "18px"}),
+            html.Div([
+                html.Label("Effect Size Threshold (Cohen's d):", style={"fontWeight": "600", "marginRight": "10px"}),
+                dcc.Slider(
+                    id='effect-size-threshold-slider',
+                    min=0, max=2, step=0.05, value=0,
+                    marks={0: '0', 0.2: '0.2', 0.5: '0.5', 0.8: '0.8', 1.0: '1.0', 1.5: '1.5', 2.0: '2.0'},
+                    tooltip={"placement": "bottom", "always_visible": False},
+                    included=False,
+                    updatemode='drag',
+                    className="mb-2",
+                    disabled=True  # 기본 비활성화
+                ),
+            ])
+        ], style={"marginBottom": "25px"}),
+
+        # Section 5: Color Direction Settings
+        html.Div([
+            html.H5("5. 🎨 Color Direction Settings", 
+                    style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            html.P("Set color direction for each stat in change tables:", 
+                   style={"fontSize": "0.9em", "color": COLORS['gray'], "marginBottom": "10px"}),
+            html.Div(id='color-direction-controls', style={"marginBottom": "10px"}),
+            dbc.Button("Apply Colors", id="apply-colors-btn", color="secondary", size="sm", className="mt-2"),
+            html.P(id='color-direction-status', 
+                   style={"fontSize": "0.9em", "color": COLORS['gray'], "marginTop": "5px"}),
+        ], style={"marginBottom": "25px"}),
+
+        # Analysis Button
+        dbc.Button("🚀 Start Analysis", id="run-button", 
+                  color="primary", className="my-3 w-100",
+                  style={"backgroundColor": COLORS['secondary'], "borderColor": COLORS['secondary'], 
+                         "fontWeight": "600", "fontSize": "1.1em", "padding": "12px"}),
+        dbc.Tooltip(
+            "Click to start analyzing the selected directories. This will process all .out files and generate comparison reports.",
+            target="run-button",
+            placement="top"
+        ),
+        
+        # Progress and Info
+        html.Div(id="progress-wrapper", 
+                children=[dbc.Progress(id="progress-bar", value=100, striped=True, animated=True)], 
+                style={'display': 'none'}),
+        html.Div(id="analysis-info-start", className="mt-3"),
+        html.Div(id="analysis-info-complete", className="mt-3"),
+        # Footer
+        html.Footer([
+            html.Hr(style={"borderColor": COLORS['light'], "margin": "30px 0"}),
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.Span("Monaco Simulation Analyzer — Created by dong63.ma", 
+                                  style={"color": COLORS['primary'], "fontWeight": "600", "marginRight": "15px"}),
+                        html.Span("| Version: v1.0.0", 
+                                  style={"color": COLORS['gray'], "marginRight": "15px"}),
+                        html.Span("| Last updated: 2025-07-21", 
+                                  style={"color": COLORS['gray'], "marginRight": "15px"}),
+                        html.Span(f"| Python {sys.version_info.major}.{sys.version_info.minor} | Dash {dash.__version__} | Plotly {plotly.__version__}", 
+                                  style={"color": COLORS['gray']})
+                    ], style={"textAlign": "center", "fontSize": "0.95em"})
+                ], width=12)
+            ])
+        ])
+    ])
+], style={"border": f"1px solid {COLORS['light']}", "boxShadow": "0 2px 10px rgba(0,0,0,0.1)"})
+
+# --- percentage-change-tab 상단 옵션 UI 추가 ---
+stat_options = [{'label': stat, 'value': stat} for stat in STATS_TO_FIND]
+
+app.layout = dbc.Container([
+    dbc.Row([
+        # Sidebar (좌측) - 접힘 가능
+        dbc.Col([
+            # 접힘 버튼 (항상 보임)
+            dbc.Row([
+                dbc.Col([
+                    dbc.Button("◀", id="sidebar-toggle", color="light", size="sm", 
+                              style={"backgroundColor": COLORS['white'], "borderColor": COLORS['gray'], 
+                                     "color": COLORS['dark'], "fontWeight": "bold", "float": "right"})
+                ], width=12, className="text-end mb-2")
+            ]),
+            # 사이드바 헤더 (접힘 가능)
+            dbc.Collapse([
+                html.H2("Options", className="display-6 mb-3", style={"color": COLORS['primary'], "fontWeight": "700"}),
+                html.Hr(),
+            ], id="sidebar-header", is_open=True),
+            # 사이드바 내용 (접힘 가능)
+            dbc.Collapse([
+                controls,
+                # 도움말 버튼 추가
+                html.Hr(className="my-4"),
+                dbc.Button("❓ Help Guide", id="help-button", color="info", size="lg", className="w-100",
+                          style={"backgroundColor": COLORS['info'], "borderColor": COLORS['info'], "fontWeight": "600"}),
+            ], id="sidebar-content", is_open=True),
+        ], id="sidebar-col", width=3, style={
+            "backgroundColor": COLORS['light'],
+            "minHeight": "100vh",
+            "padding": "30px 15px",
+            "boxShadow": "2px 0 8px rgba(0,0,0,0.04)",
+            "transition": "all 0.3s ease"
+        }),
+        # Main content (우측) - 반응형
+        dbc.Col([
+            # Header
+            html.H1("📊 Monaco Simulation Results Analyzer", 
+                    className="text-center mb-3",
+                    style={"color": COLORS['primary'], "fontWeight": "700", "fontSize": "2.5em"}),
+            html.P("Advanced simulation data analysis and comparison dashboard", 
+                   className="text-center mb-4",
+                   style={"color": COLORS['gray'], "fontSize": "1.1em", "fontStyle": "italic"}),
+            # Save HTML Button (오른쪽 상단, 작게)
+            html.Div([
+                dbc.Button(
+                    "💾 Save as HTML", id="save-html-btn",
+                    color="secondary", size="sm", outline=True,
+                    className="float-end mt-2 me-2",
+                    style={"fontWeight": "600", "boxShadow": "0 1px 4px rgba(0,0,0,0.07)"}
+                ),
+                dbc.Tooltip(
+                    "Save the current dashboard view as an HTML file (including graphs, filters, etc.)",
+                    target="save-html-btn",
+                    placement="left"
+                ),
+                html.Div(id="save-status", className="float-end me-2", style={"fontSize": "0.95em", "marginTop": "2.5rem"})
+            ], style={"minHeight": "40px", "position": "relative"}),
+            # Main Tabs
+            dbc.Tabs(id="tabs-container", children=[
+                dbc.Tab(html.Div(id="absolute-values-tab"), label="📈 Absolute Values", 
+                        tab_id="absolute", label_style={"color": COLORS['primary'], "fontWeight": "600"}),
+                dbc.Tab(html.Div(id="percentage-change-tab"), label="📊 Performance Change", 
+                        tab_id="change", label_style={"color": COLORS['primary'], "fontWeight": "600"}),
+                dbc.Tab(
+                    html.Div([
+                        html.H3("Detailed Run Table", className="mt-3"),
+                        dcc.Dropdown(id='detailed-group-subgroup-dropdown', options=[], placeholder="Select test group/subgroup...", style={"marginBottom": "20px"}),
+                        html.Div(id='detailed-run-table-container')
+                    ]),
+                    label="🧾 Detailed Run Table",
+                    tab_id="detailed-run-tab",
+                    label_style={"color": COLORS['primary'], "fontWeight": "600"}
+                ),
+                dbc.Tab(
+                    html.Div([
+                        html.H3("Stat Comparison", className="mt-3"),
+                        html.Div([
+                            html.Label("Select Groups:", style={"fontWeight": "600", "marginBottom": "5px"}),
+                            html.Div([
+                                html.P("Choose one or more groups to compare all stats:", style={"fontSize": "0.9em", "color": COLORS['gray'], "marginBottom": "8px"}),
+                                dcc.Checklist(id='group-comparison-checklist', options=[], 
+                                             labelClassName="me-3", inputClassName="me-1",
+                                             style={"color": COLORS['dark']})
+                            ], style={"marginBottom": "15px"})
+                        ]),
+                        html.Div(id='stat-comparison-table-container')
+                    ]),
+                    label="📊 Stat Comparison",
+                    tab_id="stat-comparison-tab",
+                    label_style={"color": COLORS['primary'], "fontWeight": "600"}
+                ),
+            ], style={"marginBottom": "30px"}),
+            # Stores (hidden)
+            dcc.Store(id='job-start-time-store'),
+            dcc.Store(id='summary-data-store'),
+            dcc.Store(id='change-data-store'),
+            dcc.Store(id='dir-names-store'),
+            dcc.Store(id='run-change-data-store'),
+            dcc.Store(id='analysis-meta-store'),
+            dcc.Interval(id='progress-interval', interval=1000, disabled=True),
+            dcc.Store(id='stats-store', data=STATS_TO_FIND),
+            dcc.Store(id='stat-matched-keys-store'), # 추가: stat-matched-keys-store
+            dcc.Store(id='analysis-complete-store'), # 분석 완료 전용 Store
+            dcc.Store(id='study-out-dir-store', data=STUDY_OUT_DIR), # 추가: study_out_dir Store
+            dcc.Store(id='color-direction-store', data=DEFAULT_COLOR_DIRECTIONS), # 추가: 색상 방향 설정 Store
+            # Footer
+            html.Footer([
+                html.Hr(style={"borderColor": COLORS['light'], "margin": "30px 0"}),
+                dbc.Row([
+                    dbc.Col([
+                        html.Div([
+                            html.Span("Monaco Simulation Analyzer — Created by dong63.ma", 
+                                      style={"color": COLORS['primary'], "fontWeight": "600", "marginRight": "15px"}),
+                            html.Span("| Version: v1.0.0", 
+                                      style={"color": COLORS['gray'], "marginRight": "15px"}),
+                            html.Span("| Last updated: 2025-01-20", 
+                                      style={"color": COLORS['gray'], "marginRight": "15px"}),
+                            html.Span(f"| Python {sys.version_info.major}.{sys.version_info.minor} | Dash {dash.__version__} | Plotly {plotly.__version__}", 
+                                      style={"color": COLORS['gray']})
+                        ], style={"textAlign": "center", "fontSize": "0.95em"})
+                    ], width=12)
+                ])
+            ])
+        ], width=9, style={"padding": "30px 30px", "backgroundColor": COLORS['white']})
+    ], className="g-0", style={"minHeight": "100vh"}),
+    
+    # 도움말 모달
+    dbc.Modal([
+        dbc.ModalHeader([
+            dbc.ModalTitle("📖 Monaco Simulation Analyzer - User Guide", 
+                           style={"color": COLORS['primary'], "fontWeight": "600"})
+        ], style={"backgroundColor": COLORS['light']}),
+        dbc.ModalBody([
+            html.H5("🚀 Quick Start", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            html.Ol([
+                html.Li([
+                    html.Strong("Select Baseline Directory: "),
+                    "Choose the reference directory containing your baseline simulation results"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Select Target Directories: "),
+                    "Choose one or more directories to compare against the baseline"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Optional: Add Manual Paths: "),
+                    "Enter additional directory paths not listed in the dropdown"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Edit Stat List: "),
+                    "Modify the list of statistics to analyze (or edit stats.txt file)"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Configure Statistical Options: "),
+                    "Enable significance testing, set α level, correction method, and effect size threshold"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Set Color Directions: "),
+                    "Choose color direction for each stat (🔴 Red for + or 🟢 Green for +) in change tables"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Start Analysis: "),
+                    "Click 'Start Analysis' to process all .out files and generate reports"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Explore Results: "),
+                    "View absolute values, performance changes, and detailed run-level data in the tabs"
+                ], style={"marginBottom": "8px"})
+            ], style={"marginBottom": "20px"}),
+
+            html.H5("📊 Understanding Results", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            html.Ul([
+                html.Li([
+                    html.Strong("Absolute Values Tab: "),
+                    "Raw performance metrics for each directory with drill-down to run-level data"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Performance Change Tab: "),
+                    "Percentage changes with statistical significance (★) and effect size (Cohen's d)"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Detailed Run Table Tab: "),
+                    "Run-by-run comparison showing absolute values and changes side by side"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Statistical Significance: "),
+                    "★ indicates statistically significant changes (p-adj < α)"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Effect Size: "),
+                    "Cohen's d: ~0.2 (small), ~0.5 (medium), ~0.8+ (large)"
+                ], style={"marginBottom": "8px"}),
+                html.Li([
+                    html.Strong("Color Coding: "),
+                    "Green/red pastel colors indicate improvement/regression magnitude. Customizable direction per stat"
+                ], style={"marginBottom": "8px"})
+            ], style={"marginBottom": "20px"}),
+
+            html.H5("⚙️ Key Features", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            html.Ul([
+                html.Li("Automatic .out file discovery and parsing"),
+                html.Li("Multi-processor analysis for fast processing"),
+                html.Li("Statistical significance testing with multiple comparison corrections"),
+                html.Li("Effect size analysis (Cohen's d)"),
+                html.Li("Interactive drill-down from summary to run-level data"),
+                html.Li("CSV export for all tables"),
+                html.Li("HTML snapshot saving"),
+                html.Li("Customizable stat list"),
+                html.Li("Natural sorting of run names (run1, run2, ..., run10)"),
+                html.Li("Responsive design for all screen sizes")
+            ], style={"marginBottom": "20px"}),
+
+            html.H5("💡 Tips", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
+            html.Ul([
+                html.Li("Use the sidebar toggle (◀/▶) to maximize viewing area"),
+                html.Li("Click on table cells to drill down to run-level details"),
+                html.Li("Adjust statistical options for more rigorous analysis"),
+                html.Li("Export tables for further analysis in external tools"),
+                html.Li("Save HTML snapshots to preserve current view with all filters")
+            ])
+        ]),
+        dbc.ModalFooter([
+            dbc.Button("Close", id="close-help", className="ms-auto", 
+                      style={"backgroundColor": COLORS['secondary'], "borderColor": COLORS['secondary']})
+        ])
+    ], id="help-modal", is_open=False, size="lg")
+], fluid=True)
+
+# --- 콜백 함수들 ---
+# [설명] 사용자 인터랙션(분석 시작, 진행/완료 표시, 데이터 분석, 시각화 등)에 따라 동적으로 UI를 업데이트하는 Dash 콜백 함수들입니다.
+
+# 통계 옵션 활성화 체크박스에 따라 슬라이더/드롭다운 활성화
 @app.callback(
-    Output('baseline-stats-list', 'children'),
-    [Input('stats-store', 'data'),
-     Input('stat-matched-keys-store', 'data')]
+    [Output('alpha-slider', 'disabled'),
+     Output('correction-method-dropdown', 'disabled'),
+     Output('effect-size-threshold-slider', 'disabled')],
+    Input('enable-statistical-options', 'value')
 )
-def update_baseline_stats_list(stats, matched_keys):
-    if not stats:
-        return []
-    items = []
-    for stat in stats:
-        keys = matched_keys.get(stat, []) if matched_keys else []
-        tooltip = f"Matched keys: {', '.join(keys)}" if keys else "No matched keys yet. Will be shown after analysis."
-        items.append(
-            html.Li([
-                html.Span(stat, id={'type': 'stat-tooltip', 'stat': stat}, style={"color": COLORS['dark'], "marginBottom": "5px"}),
-                dbc.Tooltip(tooltip, target={'type': 'stat-tooltip', 'stat': stat}, placement="right")
-            ], style={"marginBottom": "5px"})
-        )
-    return items
+def toggle_statistical_options(enabled):
+    disabled = not enabled
+    return [disabled, disabled, disabled]
+
+# 콜백 1: '분석 시작' 버튼 클릭 시, 스토어 초기화, 진행률 바 활성화, 버튼 비활성화
+@app.callback(
+    [Output('job-start-time-store', 'data'),
+     Output('progress-interval', 'disabled'),
+     Output('progress-wrapper', 'style'),
+     Output('run-button', 'disabled'),
+     Output('summary-data-store', 'data', allow_duplicate=True),
+     Output('change-data-store', 'data', allow_duplicate=True),
+     Output('dir-names-store', 'data', allow_duplicate=True),
+     Output('analysis-meta-store', 'data')],
+    Input('run-button', 'n_clicks'),
+    State('baseline-dropdown', 'value'),
+    State('target-checklist', 'value'),
+    State('manual-path-input', 'value'),
+    State('study-out-dir-store', 'data'), # 추가
+    prevent_initial_call=True,
+)
+def start_analysis_job(n_clicks, baseline_dir, target_dirs_checked, manual_paths, study_out_dir):
+    import datetime, time, os
+    start_time = time.time()
+    def resolve_path(p):
+        if not p:
+            return None
+        if os.path.isabs(p):
+            return p
+        return str(Path(study_out_dir) / p)
+    dirs = [resolve_path(baseline_dir)] if baseline_dir else []
+    if target_dirs_checked:
+        dirs += [resolve_path(p) for p in target_dirs_checked]
+    if manual_paths:
+        dirs += [resolve_path(p.strip()) for p in manual_paths.split('\n') if p.strip()]
+    dirs = [d for d in dict.fromkeys(dirs) if d]
+    start_str = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
+    meta = {'dirs': dirs, 'start_str': start_str}
+    # summary-data-store.data를 항상 None으로 리셋
+    return start_time, False, {'display': 'block'}, True, None, None, None, meta
+
+# 콜백 2: [백그라운드] 실제 분석을 수행하고 결과를 dcc.Store에 저장
+def cohens_d(x, y):
+    # 두 집단의 Cohen's d
+    nx, ny = len(x), len(y)
+    if nx < 2 or ny < 2:
+        return np.nan
+    mean_x, mean_y = np.mean(x), np.mean(y)
+    s1, s2 = np.var(x, ddof=1), np.var(y, ddof=1)
+    pooled_std = np.sqrt(((nx - 1) * s1 + (ny - 1) * s2) / (nx + ny - 2))
+    if pooled_std == 0:
+        return 0.0
+    return (mean_x - mean_y) / pooled_std
 
 # 3. 분석 콜백에서 stats-store의 값을 사용
 @app.callback(
@@ -624,7 +1111,7 @@ def update_baseline_stats_list(stats, matched_keys):
     manager=background_callback_manager,
     prevent_initial_call=True,
 )
-def run_analysis_callback(set_progress, baseline_dir, target_dirs_checked, manual_paths, alpha, correction_method, effect_size_threshold, stats_to_find, enable_statistical_options, study_out_dir):
+def update_percentage_change_tab(set_progress, baseline_dir, target_dirs_checked, manual_paths, alpha, correction_method, effect_size_threshold, stats_to_find, enable_statistical_options, study_out_dir):
     import os
     def resolve_path(p):
         if not p:
@@ -656,8 +1143,45 @@ def run_analysis_callback(set_progress, baseline_dir, target_dirs_checked, manua
     if summaries[0] is not None:
         for i in range(1, len(summaries)):
             if summaries[i] is not None:
-                base = summaries[0].groupby(['Subgroup', 'Stat'])['Value'].mean().reset_index()
-                targ = summaries[i].groupby(['Subgroup', 'Stat'])['Value'].mean().reset_index()
+                # 가중 평균 계산
+                weights_dict = load_weights_from_json('./weights.json')
+                
+                # baseline 가중 평균
+                base_weighted_records = []
+                for (group, subgroup, stat), group_df in summaries[0].groupby(['Group', 'Subgroup', 'Stat']):
+                    values = group_df['Value'].tolist()
+                    runs = group_df['Run'].tolist()
+                    weights = []
+                    for run in runs:
+                        filename = f"{run}"
+                        weight = get_file_weight(subgroup, filename, weights_dict)
+                        weights.append(weight)
+                    weighted_avg = weighted_average(values, weights)
+                    base_weighted_records.append({
+                        'Subgroup': subgroup,
+                        'Stat': stat,
+                        'Value': weighted_avg
+                    })
+                base = pd.DataFrame(base_weighted_records)
+                
+                # target 가중 평균
+                targ_weighted_records = []
+                for (group, subgroup, stat), group_df in summaries[i].groupby(['Group', 'Subgroup', 'Stat']):
+                    values = group_df['Value'].tolist()
+                    runs = group_df['Run'].tolist()
+                    weights = []
+                    for run in runs:
+                        filename = f"{run}.out"
+                        weight = get_file_weight(subgroup, filename, weights_dict)
+                        weights.append(weight)
+                    weighted_avg = weighted_average(values, weights)
+                    targ_weighted_records.append({
+                        'Subgroup': subgroup,
+                        'Stat': stat,
+                        'Value': weighted_avg
+                    })
+                targ = pd.DataFrame(targ_weighted_records)
+                
                 merged = pd.merge(targ, base, on=['Subgroup', 'Stat'], suffixes=('_target', '_baseline'), how='outer')
                 merged['Change'] = ((merged['Value_target'] - merged['Value_baseline']) / merged['Value_baseline']) * 100
                 if enable_statistical_options:
@@ -779,18 +1303,41 @@ def update_progress_label(n_intervals, summary_data, start_time):
 def update_absolute_values_tab(summaries_json, dir_names, stats_to_find, matched_keys):
     if summaries_json is None:
         return "Please start analysis or wait for it to complete."
+    
+    # 가중치 로드
+    weights_dict = load_weights_from_json('./weights.json')
+    
     output_components = []
     for i, summary_json in enumerate(summaries_json):
         if summary_json is None:
             continue
         dir_name = dir_names[i]
-        summary_df = pd.read_json(summary_json, orient='split')
+        summary_df = pd.read_json(StringIO(summary_json), orient='split')
         output_components.append(html.H3(f"📁 {dir_name} Absolute Value Analysis", className="mt-4"))
         # 파일명 생성
         now_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        # subgroup별 stat별 평균 테이블
-        if {'Subgroup', 'Stat', 'Value'}.issubset(summary_df.columns):
-            pivot_df = summary_df.groupby(['Subgroup', 'Stat'])['Value'].mean().reset_index()
+        # subgroup별 stat별 가중 평균 테이블
+        if {'Subgroup', 'Stat', 'Value', 'Run'}.issubset(summary_df.columns):
+            # 가중 평균 계산
+            weighted_avg_records = []
+            for (group, subgroup, stat), group_df in summary_df.groupby(['Group', 'Subgroup', 'Stat']):
+                values = group_df['Value'].tolist()
+                runs = group_df['Run'].tolist()
+                weights = []
+                for run in runs:
+                    filename = f"{run}.out"
+                    weight = get_file_weight(subgroup, filename, weights_dict)
+                    weights.append(weight)
+                
+                weighted_avg = weighted_average(values, weights)
+                weighted_avg_records.append({
+                    'Group': group,
+                    'Subgroup': subgroup,
+                    'Stat': stat,
+                    'Value': weighted_avg
+                })
+            
+            pivot_df = pd.DataFrame(weighted_avg_records)
             table_df = pivot_df.pivot(index='Subgroup', columns='Stat', values='Value')
             # stat-list 기준 컬럼 보장
             for stat in stats_to_find:
@@ -836,20 +1383,39 @@ def update_absolute_values_tab(summaries_json, dir_names, stats_to_find, matched
                 ])
             ], style={"fontSize": "0.95em", "color": "#888", "marginTop": "10px"})
         ])
-        # group별, stat별 그래프 (subgroup별 평균)
+        # group별, stat별 그래프 (subgroup별 가중 평균)
         if {'Subgroup', 'Stat', 'Value'}.issubset(summary_df.columns):
             stat_graphs = []
             for stat in stats_to_find:
-                stat_df = summary_df.groupby(['Subgroup', 'Stat'])['Value'].mean().reset_index()
-                stat_df = stat_df[stat_df['Stat'] == stat]
-                fig = px.bar(stat_df, x='Subgroup', y='Value', title=f"{dir_name} - {stat} (Average)", 
-                             labels={'Value': stat, 'Subgroup': 'Subgroup'},
-                             color_discrete_sequence=[PLOTLY_COLORS[i % len(PLOTLY_COLORS)]])
-                fig.update_layout(title_x=0.5, 
-                                 plot_bgcolor=COLORS['white'],
-                                 paper_bgcolor=COLORS['white'],
-                                 font={'color': COLORS['dark']})
-                stat_graphs.append(dbc.Col(dcc.Graph(figure=fig), width=12, lg=6, xl=4))
+                # 가중 평균 데이터로 그래프 생성
+                stat_weighted_records = []
+                for (group, subgroup), group_df in summary_df.groupby(['Group', 'Subgroup']):
+                    stat_df = group_df[group_df['Stat'] == stat]
+                    if not stat_df.empty:
+                        values = stat_df['Value'].tolist()
+                        runs = stat_df['Run'].tolist()
+                        weights = []
+                        for run in runs:
+                            filename = f"{run}.out"
+                            weight = get_file_weight(subgroup, filename, weights_dict)
+                            weights.append(weight)
+                        
+                        weighted_avg = weighted_average(values, weights)
+                        stat_weighted_records.append({
+                            'Subgroup': subgroup,
+                            'Value': weighted_avg
+                        })
+                
+                if stat_weighted_records:
+                    stat_df = pd.DataFrame(stat_weighted_records)
+                    fig = px.bar(stat_df, x='Subgroup', y='Value', title=f"{dir_name} - {stat} (Weighted Average)", 
+                                 labels={'Value': stat, 'Subgroup': 'Subgroup'},
+                                 color_discrete_sequence=[PLOTLY_COLORS[i % len(PLOTLY_COLORS)]])
+                    fig.update_layout(title_x=0.5, 
+                                     plot_bgcolor=COLORS['white'],
+                                     paper_bgcolor=COLORS['white'],
+                                     font={'color': COLORS['dark']})
+                    stat_graphs.append(dbc.Col(dcc.Graph(figure=fig), width=12, lg=6, xl=4))
             output_components.append(dbc.Row(stat_graphs))
         output_components.append(html.Hr())
     return output_components
@@ -939,7 +1505,7 @@ def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_
         if change_json is None:
             output_components.append(html.P("Comparison failed for target directory."))
             continue
-        table_df = pd.read_json(change_json, orient='split')
+        table_df = pd.read_json(StringIO(change_json), orient='split')
         # MultiIndex → 단일 인덱스(str)
         table_df.columns = [
             col if col == 'Subgroup' else f"{col[0]}_{col[1]}"
@@ -1013,7 +1579,7 @@ def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_
                     d[col] = row[col]
             data.append(d)
         output_components.extend([
-            html.H4("Average Performance Change (%)", className="mt-3"),
+            html.H4("Weighted Average Performance Change (%)", className="mt-3"),
             dash_table.DataTable(
                 id={'type': 'change-table', 'index': i},
                 data=data,
@@ -1036,7 +1602,7 @@ def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_
                 ])
             ], style={"fontSize": "0.95em", "color": "#888", "marginTop": "10px"})
         ])
-        # --- 그래프 추가 ---
+        # --- 그래프 추가 (가중 평균 기반) ---
         figures = []
         for stat in stats_to_find:
             stat_col = f"{stat}_Change"
@@ -1046,7 +1612,7 @@ def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_
             graph_df = graph_df[graph_df['Subgroup'] != '']
             graph_df = graph_df.reset_index(drop=True)
             if not graph_df.empty and len(graph_df['Subgroup']) == len(graph_df[stat_col]):
-                fig = px.bar(graph_df, x='Subgroup', y=stat_col, title=f"{stat} Change (%)", 
+                fig = px.bar(graph_df, x='Subgroup', y=stat_col, title=f"{stat} Weighted Average Change (%)", 
                              labels={stat_col: 'Change (%)', 'Subgroup': 'Subgroup'},
                              color_discrete_sequence=[PLOTLY_COLORS[i % len(PLOTLY_COLORS)]])
                 fig.update_layout(title_x=0.5,
@@ -1080,16 +1646,30 @@ def show_run_level_table(active_cell, table_data, run_change_dfs_json, dir_names
     run_json = run_change_dfs_json[idx] if idx < len(run_change_dfs_json) else None
     if not run_json:
         return []
-    run_df = pd.read_json(run_json, orient='split')
+    run_df = pd.read_json(StringIO(run_json), orient='split')
     run_df = run_df[run_df['Subgroup'] == subgroup]
     if run_df.empty:
         return html.P("No run-level data for this subgroup.")
+    
     # wide format: Run, stat1, stat2, ...
     pivot_df = run_df.pivot_table(index='Run', columns='Stat', values='Change', aggfunc='mean').reset_index().round(2)
     # Run 자연스러운 오름차순 정렬
     pivot_df = pivot_df.sort_values('Run', key=lambda x: x.map(natural_key)).reset_index(drop=True)
+    
+    # Weight 컬럼 추가 (DataFrame에서 직접 가져오기)
+    if 'Weight' in run_df.columns:
+        run_weights = run_df.groupby('Run')['Weight'].first()
+        pivot_df['Weight'] = pivot_df['Run'].map(run_weights)
+    else:
+        # Weight 컬럼이 없는 경우 기본값 1.0 설정
+        pivot_df['Weight'] = 1.0
+    
+    # Weight를 두 번째 열로 이동
+    cols = ['Run', 'Weight'] + [col for col in pivot_df.columns if col not in ['Run', 'Weight']]
+    pivot_df = pivot_df[cols]
+    
     # 파스텔톤 히트맵 적용
-    stat_cols = [col for col in pivot_df.columns if col != 'Run']
+    stat_cols = [col for col in pivot_df.columns if col != 'Run' and col != 'Weight']
     style_data_conditional = []
     for stat in stat_cols:
         vmin = pivot_df[stat].min()
@@ -1105,6 +1685,7 @@ def show_run_level_table(active_cell, table_data, run_change_dfs_json, dir_names
     min_row = {'Run': 'mean'}
     for stat in stat_cols:
         min_row[stat] = pivot_df[stat].mean()  # 평균, min으로 바꾸려면 .min()
+    min_row['Weight'] = pivot_df['Weight'].mean()  # 평균 가중치
     pivot_df = pd.concat([pivot_df, pd.DataFrame([min_row])], ignore_index=True)
     return dash_table.DataTable(
         data=pivot_df.round(4).to_dict('records'),
@@ -1121,7 +1702,7 @@ def show_run_level_table(active_cell, table_data, run_change_dfs_json, dir_names
 @app.callback(Output({'type': 'graph-container', 'index': MATCH}, 'children'), Input({'type': 'group-checklist', 'index': MATCH}, 'value'), State({'type': 'comparison-store', 'index': MATCH}, 'data'))
 def update_graphs(selected_groups, json_data):
     if not selected_groups or not json_data: return []
-    df = pd.read_json(json_data, orient='split')
+    df = pd.read_json(StringIO(json_data), orient='split')
     # change_df: columns=['Subgroup', 'L2_cache_miss_rate', 'ipc', ...]
     figures = []
     for stat in [col for col in df.columns if col != 'Subgroup']:
@@ -1139,7 +1720,7 @@ def update_graphs(selected_groups, json_data):
 @app.callback(Output({'type': 'download-html', 'index': MATCH}, "data"), Input({'type': 'download-button', 'index': MATCH}, "n_clicks"), State({'type': 'comparison-store', 'index': MATCH}, "data"), State({'type': 'group-checklist', 'index': MATCH}, 'value'), State({'type': 'download-filename', 'index': MATCH}, 'value'), prevent_initial_call=True)
 def download_html(n_clicks, json_data, selected_groups, filename):
     if not json_data or not selected_groups: return dash.no_update
-    df = pd.read_json(json_data, orient='split')
+    df = pd.read_json(StringIO(json_data), orient='split')
     dff = df.loc[selected_groups].fillna(0).round(2).reset_index()
     html_string = dff.to_html(index=False, classes='table table-striped text-center', justify='center')
     final_filename = filename if filename else "report.html"
@@ -1157,7 +1738,7 @@ def download_html(n_clicks, json_data, selected_groups, filename):
 def update_absolute_graphs(selected_groups, json_data):
     if not selected_groups or not json_data:
         return []
-    df = pd.read_json(json_data, orient='split')
+    df = pd.read_json(StringIO(json_data), orient='split')
     # group, stat별로 그래프 생성
     figures = []
     for group in selected_groups:
@@ -1371,6 +1952,10 @@ def analyze_directory(root_path: Path, stats_to_find: list):
     group_name = root_path.name
     subgroups = ['sub1','sub2','sub3','sub4']  # 하드코딩된 subgroups
     offsets_dict = build_all_offsets(report_files, stats_to_find, subgroups)
+    
+    # 가중치 로드
+    weights_dict = load_weights_from_json('./weights.json')
+    
     results = []
     all_matched_keys = {stat: set() for stat in stats_to_find}
     # stats_hash = hashlib.md5(','.join(stats_to_find).encode()).hexdigest()
@@ -1425,23 +2010,29 @@ def analyze_directory(root_path: Path, stats_to_find: list):
     
     if not results:
         return None, {stat: list(keys) for stat, keys in all_matched_keys.items()}
+    
+    # 원본 데이터를 DataFrame으로 변환 (가중치 포함)
     records = []
     for group, subgroup, run, stats in results:
+        # 해당 run의 가중치 계산
+        filename = f"{run}.out"
+        weight = get_file_weight(subgroup, filename, weights_dict)
+        
         for stat, value in stats.items():
             records.append({
                 'Group': group,
                 'Subgroup': subgroup,
                 'Run': run,
                 'Stat': stat,
-                'Value': value
+                'Value': value,
+                'Weight': weight
             })
+    
     df = pd.DataFrame(records)
     if df.empty:
         return None, {stat: list(keys) for stat, keys in all_matched_keys.items()}
-    df['SubgroupPrefix'] = df['Subgroup'].str[:5]
-    df_agg = df.groupby(['Group', 'SubgroupPrefix', 'Run', 'Stat'], as_index=False)['Value'].mean()
-    df_agg = df_agg.rename(columns={'SubgroupPrefix': 'Subgroup'})
-    return df_agg, {stat: list(keys) for stat, keys in all_matched_keys.items()}
+    
+    return df, {stat: list(keys) for stat, keys in all_matched_keys.items()}
 
 def build_offsets_for_subgroup(subgroup, sample_file, stats_to_find):
     """
@@ -1555,12 +2146,13 @@ def show_abs_run_level_table(active_cell, table_data, summaries_json, dir_names,
     summary_json = summaries_json[idx]
     if not summary_json:
         return []
-    summary_df = pd.read_json(summary_json, orient='split')
+    summary_df = pd.read_json(StringIO(summary_json), orient='split')
     # run별, stat별 wide format
-    if {'Subgroup', 'Run', 'Stat', 'Value'}.issubset(summary_df.columns):
+    if {'Subgroup', 'Run', 'Stat', 'Value', 'Weight'}.issubset(summary_df.columns):
         run_df = summary_df[summary_df['Subgroup'] == subgroup]
         if run_df.empty:
             return html.P("No run-level data for this subgroup.")
+        
         pivot_df = run_df.pivot_table(index='Run', columns='Stat', values='Value', aggfunc='mean').reset_index().round(4)
         # stat-list 기준 컬럼 보장
         for stat in stats_to_find:
@@ -1569,11 +2161,22 @@ def show_abs_run_level_table(active_cell, table_data, summaries_json, dir_names,
         pivot_df = pivot_df[['Run'] + stats_to_find]
         # Run 자연스러운 오름차순 정렬
         pivot_df = pivot_df.sort_values('Run', key=lambda x: x.map(natural_key)).reset_index(drop=True)
+        
+        # Weight 컬럼 추가 (DataFrame에서 직접 가져오기)
+        run_weights = run_df.groupby('Run')['Weight'].first()
+        pivot_df['Weight'] = pivot_df['Run'].map(run_weights)
+        
+        # Weight를 두 번째 열로 이동
+        cols = ['Run', 'Weight'] + [col for col in pivot_df.columns if col not in ['Run', 'Weight']]
+        pivot_df = pivot_df[cols]
+        
         # 평균 행 추가
         min_row = {'Run': 'mean'}
         for stat in stats_to_find:
             min_row[stat] = pivot_df[stat].mean()
+        min_row['Weight'] = pivot_df['Weight'].mean()  # 평균 가중치
         pivot_df = pd.concat([pivot_df, pd.DataFrame([min_row])], ignore_index=True)
+        
         return dash_table.DataTable(
             data=pivot_df.round(4).to_dict('records'),
             columns=[{"name": c, "id": c} for c in pivot_df.columns],
@@ -1606,7 +2209,7 @@ def get_group_subgroup_options(summaries_json, dir_names):
     for i, summary_json in enumerate(summaries_json):
         if not summary_json:
             continue
-        df = pd.read_json(summary_json, orient='split')
+        df = pd.read_json(StringIO(summary_json), orient='split')
         if {'Group', 'Subgroup'}.issubset(df.columns):
             for _, row in df[['Group', 'Subgroup']].drop_duplicates().iterrows():
                 label = f"{row['Group']} / {row['Subgroup']}"
@@ -1639,20 +2242,29 @@ def update_detailed_run_table(selected_value, summaries_json, run_change_dfs_jso
     summary_json = summaries_json[i]
     if not summary_json:
         return "No data."
-    summary_df = pd.read_json(summary_json, orient='split')
+    summary_df = pd.read_json(StringIO(summary_json), orient='split')
     # 해당 group/subgroup의 run별 데이터
     run_df = summary_df[(summary_df['Group'] == group) & (summary_df['Subgroup'] == subgroup)]
     if run_df.empty:
         return "No run-level data for this group/subgroup."
+    
     # run별, stat별 절대값
     abs_pivot = run_df.pivot_table(index='Run', columns='Stat', values='Value', aggfunc='mean').reset_index()
     # Run 자연스러운 오름차순 정렬
     abs_pivot = abs_pivot.sort_values('Run', key=lambda x: x.map(natural_key)).reset_index(drop=True)
     
+    # Weight 컬럼 추가 (DataFrame에서 직접 가져오기)
+    if 'Weight' in run_df.columns:
+        run_weights = run_df.groupby('Run')['Weight'].first()
+        abs_pivot['Weight'] = abs_pivot['Run'].map(run_weights)
+    else:
+        # Weight 컬럼이 없는 경우 기본값 1.0 설정
+        abs_pivot['Weight'] = 1.0
+    
     # run_change_data_store에서 해당 group/subgroup의 run별 변화량 데이터 가져오기
     change_pivot = None
     if run_change_dfs_json and i > 0 and i-1 < len(run_change_dfs_json) and run_change_dfs_json[i-1]:
-        run_change_df = pd.read_json(run_change_dfs_json[i-1], orient='split')
+        run_change_df = pd.read_json(StringIO(run_change_dfs_json[i-1]), orient='split')
         # 해당 subgroup의 run별 변화량 데이터 필터링
         subgroup_change_df = run_change_df[run_change_df['Subgroup'] == subgroup]
         if not subgroup_change_df.empty:
@@ -1663,7 +2275,7 @@ def update_detailed_run_table(selected_value, summaries_json, run_change_dfs_jso
     # baseline 비교를 위해 baseline summary도 준비 (run별 변화량이 없을 때 사용)
     baseline_df = None
     if i != 0 and summaries_json[0]:
-        baseline_df = pd.read_json(summaries_json[0], orient='split')
+        baseline_df = pd.read_json(StringIO(summaries_json[0]), orient='split')
     
     # 변화량 계산
     if change_pivot is not None:
@@ -1701,15 +2313,16 @@ def update_detailed_run_table(selected_value, summaries_json, run_change_dfs_jso
         # baseline이 없으면 모든 변화량을 NaN으로
         for stat in stats_to_find:
             abs_pivot[f'{stat}_Change'] = np.nan
-    # columns: Run, stat1_Absolute, stat1_Change, stat2_Absolute, stat2_Change, ...
-    columns = [{'name': 'Run', 'id': 'Run'}]
+    
+    # Weight를 두 번째 열로 이동 (변화량 계산 후에 수행)
+    cols = ['Run', 'Weight'] + [col for col in abs_pivot.columns if col not in ['Run', 'Weight']]
+    abs_pivot = abs_pivot[cols]
+    
+    # columns: Run, Weight, stat1_Absolute, stat1_Change, stat2_Absolute, stat2_Change, ...
+    columns = [{'name': 'Run', 'id': 'Run'}, {'name': 'Weight', 'id': 'Weight'}]
     data = []
-    for stat in stats_to_find:
-        columns.append({'name': [stat, 'Absolute'], 'id': stat})
-        columns.append({'name': [stat, 'Change(%)'], 'id': f'{stat}_Change'})
-    # 데이터 가공
     for _, row in abs_pivot.iterrows():
-        d = {'Run': row['Run']}
+        d = {'Run': row['Run'], 'Weight': round(row['Weight'], 2)}
         for stat in stats_to_find:
             val = row.get(stat, np.nan)
             chg_col = f'{stat}_Change'
@@ -1812,6 +2425,217 @@ def update_color_directions(n_clicks, color_values, color_ids, stats_to_find):
     
     return new_color_directions, f"✅ Color directions updated for {len(stats_to_find)} stats"
 
+# --- 새로운 탭: Stat Comparison ---
+
+def get_available_stats(summaries_json, dir_names):
+    """분석된 데이터에서 사용 가능한 stats 목록을 반환"""
+    if not summaries_json or not dir_names:
+        return []
+    
+    available_stats = set()
+    for summary_json in summaries_json:
+        if summary_json:
+            df = pd.read_json(StringIO(summary_json), orient='split')
+            if 'Stat' in df.columns:
+                available_stats.update(df['Stat'].unique())
+    
+    return [{'label': stat, 'value': stat} for stat in sorted(available_stats)]
+
+def get_available_groups(summaries_json, dir_names):
+    """분석된 데이터에서 사용 가능한 groups 목록을 반환 (baseline 제외)"""
+    if not summaries_json or not dir_names:
+        return []
+    
+    available_groups = set()
+    baseline_group = None
+    if dir_names:
+        baseline_group = dir_names[0]
+    for i, summary_json in enumerate(summaries_json):
+        if summary_json:
+            df = pd.read_json(StringIO(summary_json), orient='split')
+            if 'Group' in df.columns:
+                available_groups.update(df['Group'].unique())
+    # baseline group은 선택지에서 제외
+    group_options = [{'label': group, 'value': group} for group in sorted(available_groups) if group != baseline_group]
+    return group_options
+
+@app.callback(
+    Output('group-comparison-checklist', 'options'),
+    [Input('summary-data-store', 'data'),
+     State('dir-names-store', 'data')]
+)
+def update_stat_comparison_options(summaries_json, dir_names):
+    """Stat Comparison 탭의 checklist 옵션들을 업데이트 (baseline 제외)"""
+    groups_options = get_available_groups(summaries_json, dir_names)
+    return groups_options
+
+@app.callback(
+    Output('stat-comparison-table-container', 'children'),
+    [Input('group-comparison-checklist', 'value'),
+     State('summary-data-store', 'data'),
+     State('change-data-store', 'data'),
+     State('dir-names-store', 'data'),
+     State('stats-store', 'data'),
+     State('color-direction-store', 'data')]
+)
+def update_stat_comparison_table(selected_groups, summaries_json, change_dfs_json, dir_names, stats_to_find, color_directions):
+    """선택된 groups에 대한 모든 stat의 subgroup별 비교 테이블을 생성 (항상 baseline 포함)"""
+    if not summaries_json or not dir_names:
+        return "Please select at least one group to view the comparison table."
+    baseline_group = dir_names[0] if dir_names else None
+    # baseline은 항상 비교에 포함
+    compare_groups = [g for g in (selected_groups or []) if g != baseline_group]
+    if not compare_groups:
+        return "Please select at least one group (other than baseline) to view the comparison table."
+    all_tables = []
+    # 사용 가능한 모든 stat 가져오기
+    available_stats = set()
+    for summary_json in summaries_json:
+        if summary_json:
+            df = pd.read_json(StringIO(summary_json), orient='split')
+            if 'Stat' in df.columns:
+                available_stats.update(df['Stat'].unique())
+    available_stats = sorted(available_stats)
+    # baseline 데이터 준비
+    baseline_df = None
+    if summaries_json[0]:
+        baseline_df = pd.read_json(StringIO(summaries_json[0]), orient='split')
+    for stat in available_stats:
+        # baseline의 절대값
+        baseline_abs = None
+        if baseline_df is not None:
+            baseline_stat_df = baseline_df[baseline_df['Stat'] == stat]
+            if not baseline_stat_df.empty:
+                baseline_abs = baseline_stat_df.groupby('Subgroup')['Value'].mean().reset_index()
+                baseline_abs['Group'] = baseline_group
+                baseline_abs['Stat'] = stat
+        # 나머지 그룹 데이터
+        comparison_data = []
+        for i, summary_json in enumerate(summaries_json):
+            if not summary_json:
+                continue
+            group_name = dir_names[i]
+            if group_name == baseline_group or group_name not in compare_groups:
+                continue
+            df = pd.read_json(StringIO(summary_json), orient='split')
+            group_data = df[(df['Group'] == group_name) & (df['Stat'] == stat)]
+            if not group_data.empty:
+                abs_values = group_data.groupby('Subgroup')['Value'].mean().reset_index()
+                abs_values['Group'] = group_name
+                abs_values['Stat'] = stat
+                # 변화량 계산 (baseline과 비교)
+                change_col = None
+                if i > 0 and change_dfs_json and i-1 < len(change_dfs_json) and change_dfs_json[i-1]:
+                    change_df = pd.read_json(StringIO(change_dfs_json[i-1]), orient='split')
+                    change_df.columns = [col if col == 'Subgroup' else f"{col[0]}_{col[1]}" for col in change_df.columns]
+                    change_col = f"{stat}_Change"
+                    if change_col in change_df.columns:
+                        change_values = change_df[['Subgroup', change_col]].copy()
+                        change_values = change_values.rename(columns={change_col: 'Change'})
+                        merged = abs_values.merge(change_values, on='Subgroup', how='left')
+                        comparison_data.append(merged)
+                    else:
+                        abs_values['Change'] = np.nan
+                        comparison_data.append(abs_values)
+                else:
+                    abs_values['Change'] = np.nan
+                    comparison_data.append(abs_values)
+        # 데이터 병합
+        all_subgroups = set()
+        if baseline_abs is not None:
+            all_subgroups.update(baseline_abs['Subgroup'].unique())
+        for df in comparison_data:
+            all_subgroups.update(df['Subgroup'].unique())
+        all_subgroups = sorted(all_subgroups)
+        # wide format
+        result_df = pd.DataFrame({'Subgroup': all_subgroups})
+        # baseline 절대값
+        if baseline_abs is not None:
+            result_df = result_df.merge(baseline_abs[['Subgroup', 'Value']], on='Subgroup', how='left')
+            result_df = result_df.rename(columns={'Value': f'{baseline_group}_Absolute'})
+        # 나머지 그룹들
+        for df in comparison_data:
+            group = df['Group'].iloc[0]
+            result_df = result_df.merge(df[['Subgroup', 'Value']], on='Subgroup', how='left')
+            result_df = result_df.rename(columns={'Value': f'{group}_Absolute'})
+            if 'Change' in df.columns:
+                result_df = result_df.merge(df[['Subgroup', 'Change']], on='Subgroup', how='left', suffixes=('', f'_{group}_Change'))
+                result_df = result_df.rename(columns={'Change': f'{group}_Change'})
+        # 컬럼 순서: Subgroup, Baseline_Absolute, [Group1_Absolute, Group1_Change, ...]
+        columns = ['Subgroup', f'{baseline_group}_Absolute']
+        for group in compare_groups:
+            columns.append(f'{group}_Absolute')
+            columns.append(f'{group}_Change')
+        result_df = result_df[columns]
+        # 데이터 포맷팅
+        data = []
+        for _, row in result_df.iterrows():
+            d = {'Subgroup': row['Subgroup']}
+            for col in result_df.columns:
+                if col != 'Subgroup':
+                    val = row[col]
+                    if pd.notna(val):
+                        if col.endswith('_Absolute'):
+                            d[col] = round(val, 4)
+                        else:  # _Change
+                            d[col] = round(val, 2)
+                    else:
+                        d[col] = ''
+            data.append(d)
+        # 컬럼 정의
+        dash_columns = [{"name": "Subgroup", "id": "Subgroup"}]
+        dash_columns.append({"name": [baseline_group, "Absolute"], "id": f'{baseline_group}_Absolute'})
+        for group in compare_groups:
+            dash_columns.append({"name": [group, "Absolute"], "id": f'{group}_Absolute'})
+            dash_columns.append({"name": [group, "Change(%)"], "id": f'{group}_Change'})
+        # 변화량 컬럼에 히트맵 적용
+        style_data_conditional = []
+        for group in compare_groups:
+            change_col = f'{group}_Change'
+            if change_col in result_df.columns:
+                vmin = result_df[change_col].min()
+                vmax = result_df[change_col].max()
+                for irow, prow in result_df.iterrows():
+                    val = prow.get(change_col, None)
+                    if pd.notna(val):
+                        color_direction = color_directions.get(stat, 'green_for_positive') if color_directions else 'green_for_positive'
+                        color = get_pastel_gradient_color(val, vmin, vmax, stat, color_direction)
+                        style_data_conditional.append({
+                            'if': {'row_index': irow, 'column_id': change_col},
+                            'backgroundColor': color,
+                            'color': 'black'
+                        })
+        stat_table = [
+            html.H4(f"📊 {stat} Comparison", className="mt-4 mb-3", style={"color": COLORS['primary'], "fontWeight": "600"}),
+            dash_table.DataTable(
+                data=data,
+                columns=dash_columns,
+                style_table={'overflowX': 'auto'},
+                style_cell={
+                    'textAlign': 'center',
+                    'minWidth': '80px',
+                    'maxWidth': '150px',
+                    'width': '100px',
+                    'overflow': 'hidden',
+                    'textOverflow': 'ellipsis',
+                    'whiteSpace': 'nowrap',
+                },
+                style_data_conditional=style_data_conditional,
+                merge_duplicate_headers=True,
+                export_format='csv',
+                export_headers='display',
+            )
+        ]
+        all_tables.extend(stat_table)
+    if not all_tables:
+        return "No data found for selected groups."
+    selected_groups_str = ", ".join(compare_groups)
+    return [
+        html.H3(f"📊 All Stats Comparison (Baseline: {baseline_group}) vs. {selected_groups_str}", className="mt-3 mb-4", style={"color": COLORS['primary'], "fontWeight": "700"}),
+        html.P(f"Showing absolute values and percentage changes for all stats across subgroups. Baseline is always shown for comparison.", style={"color": COLORS['gray'], "fontStyle": "italic", "marginBottom": "20px"}),
+        html.Div(all_tables)
+    ]
+
 def split_by_last_dot(text):
     """마지막 . 을 기준으로 텍스트를 분리합니다."""
     if '.' not in text:
@@ -1825,6 +2649,37 @@ def split_by_last_dot(text):
     suffix = text[last_dot_index + 1:]  # +1로 . 을 제거합니다
     
     return prefix, suffix
+
+def load_weights_from_json(weights_file='./weights.json'):
+    """JSON 파일에서 subgroup별 파일 가중치를 로드합니다."""
+    try:
+        if os.path.exists(weights_file):
+            with open(weights_file, 'r', encoding='utf-8') as f:
+                weights_data = json.load(f)
+                return weights_data.get('weights', {})
+        else:
+            print(f"Weights file '{weights_file}' not found. Using default weights (1.0 for all files).")
+            return {}
+    except Exception as e:
+        print(f"Error loading weights file: {e}. Using default weights.")
+        return {}
+
+def weighted_average(values, weights):
+    """가중 평균을 계산합니다."""
+    if not values or not weights or len(values) != len(weights):
+        return np.mean(values) if values else 0.0
+    
+    total_weight = sum(weights)
+    if total_weight == 0:
+        return np.mean(values)
+    
+    return sum(v * w for v, w in zip(values, weights)) / total_weight
+
+def get_file_weight(subgroup, filename, weights_dict):
+    """특정 subgroup의 특정 파일에 대한 가중치를 반환합니다."""
+    if subgroup in weights_dict and filename in weights_dict[subgroup]:
+        return weights_dict[subgroup][filename]
+    return 1.0  # 기본 가중치
 
 if __name__ == "__main__":
     app.run(debug=False)
