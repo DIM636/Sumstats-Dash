@@ -1171,7 +1171,7 @@ def update_percentage_change_tab(set_progress, baseline_dir, target_dirs_checked
                     runs = group_df['Run'].tolist()
                     weights = []
                     for run in runs:
-                        filename = f"{run}.out"
+                        filename = f"{run}"
                         weight = get_file_weight(subgroup, filename, weights_dict)
                         weights.append(weight)
                     weighted_avg = weighted_average(values, weights)
@@ -2015,7 +2015,7 @@ def analyze_directory(root_path: Path, stats_to_find: list):
     records = []
     for group, subgroup, run, stats in results:
         # 해당 run의 가중치 계산
-        filename = f"{run}.out"
+        filename = f"{run}"
         weight = get_file_weight(subgroup, filename, weights_dict)
         
         for stat, value in stats.items():
@@ -2320,6 +2320,9 @@ def update_detailed_run_table(selected_value, summaries_json, run_change_dfs_jso
     
     # columns: Run, Weight, stat1_Absolute, stat1_Change, stat2_Absolute, stat2_Change, ...
     columns = [{'name': 'Run', 'id': 'Run'}, {'name': 'Weight', 'id': 'Weight'}]
+    for stat in stats_to_find:
+        columns.append({'name': [stat, 'Absolute'], 'id': stat})
+        columns.append({'name': [stat, 'Change(%)'], 'id': f'{stat}_Change'})
     data = []
     for _, row in abs_pivot.iterrows():
         d = {'Run': row['Run'], 'Weight': round(row['Weight'], 2)}
