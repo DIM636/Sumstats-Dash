@@ -122,460 +122,13 @@ app.title = "Monaco Simulation Analyzer"
 discovered_dirs = find_subdirectories(Path(STUDY_OUT_DIR), depth=5)
 dir_options = [{'label': os.path.basename(p), 'value': p} for p in discovered_dirs]
 
-# 1. 사이드바 controls에 stat 목록 편집 UI 추가
-controls = dbc.Card([
-    dbc.CardHeader([
-        html.H4("📊 Analysis Configuration", className="card-title mb-0", 
-                style={"color": COLORS['primary'], "fontWeight": "600"})
-    ], style={"backgroundColor": COLORS['light'], "borderBottom": f"3px solid {COLORS['secondary']}"}),
-    dbc.CardBody([
-        # study_out_dir 입력 및 Search 버튼
-        html.Div([
-            html.H5("Study Output Directory", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "10px"}),
-            dcc.Input(id='study-out-dir-input', type='text', value=STUDY_OUT_DIR, style={"width": "80%", "marginRight": "8px"}),
-            dbc.Button("Search", id="study-out-dir-search-btn", color="secondary", size="sm"),
-            html.P(id='study-out-dir-status', style={"fontSize": "0.95em", "color": COLORS['gray'], "marginTop": "5px"}),
-        ], style={"marginBottom": "18px"}),
-        # stat 목록 편집
-        html.Div([
-            html.H5("Edit Stat List", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "10px"}),
-            dcc.Textarea(id='stat-list-input', value='\n'.join(STATS_TO_FIND), style={"width": "100%", "height": "80px", "borderColor": COLORS['secondary']}),
-            dbc.Button("Apply", id="stat-list-apply-btn", color="secondary", size="sm", className="mt-2 me-2"),
-            dbc.Button("Reset to Default", id="stat-list-reset-btn", color="light", size="sm", className="mt-2"),
-            html.P(id='stat-list-status', style={"fontSize": "0.95em", "color": COLORS['gray'], "marginTop": "5px"}),
-        ], style={"marginBottom": "18px"}),
-        # Section 1: Baseline Directory
-        html.Div([
-            html.H5("1. Select Baseline Directory", 
-                    style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
-            html.Div([
-                html.P("This tool analyzes the following stats:", 
-                       style={"fontWeight": "600", "color": COLORS['dark'], "marginBottom": "10px"}),
-                html.Ul(id='baseline-stats-list', children=[html.Li(stat, style={"color": COLORS['dark'], "marginBottom": "5px"}) for stat in STATS_TO_FIND], 
-                       style={"backgroundColor": COLORS['light'], "padding": "10px", "borderRadius": "5px"}),
-                html.P("Click 'Start Analysis' to automatically aggregate and compare the above stats for the selected directories.", 
-                       style={"fontSize": "0.95em", "color": COLORS['gray'], "fontStyle": "italic"})
-            ], className="mb-4"),
-            dcc.Dropdown(id='baseline-dropdown', options=dir_options, 
-                        placeholder="Select the baseline directory...",
-                        style={"borderColor": COLORS['secondary']})
-        ], style={"marginBottom": "25px"}),
-        
-        # Section 2: Target Directories
-        html.Div([
-            html.H5("2. Select Target Directories", 
-                    style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
-            dcc.Checklist(id='target-checklist', options=dir_options, 
-                         labelClassName="me-3", inputClassName="me-1",
-                         style={"color": COLORS['dark']})
-        ], style={"marginBottom": "25px"}),
-        
-        # Section 3: Manual Paths
-        html.Div([
-            html.H5("3. (Optional) Add Directories Manually", 
-                    style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
-            dbc.Textarea(id="manual-path-input", 
-                        placeholder="Enter directory paths not listed above, one per line...", 
-                        style={'height': '80px', "borderColor": COLORS['secondary']})
-        ], style={"marginBottom": "25px"}),
-
-        # Section 4: Statistical Test Options
-        html.Div([
-            html.H5("4. Statistical Test Options", 
-                    style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
-            # 추가: 통계 옵션 활성화 체크박스
-            dbc.Checkbox(
-                id='enable-statistical-options',
-                value=False,
-                label="Enable statistical test & effect size analysis",
-                style={"marginBottom": "10px", "fontWeight": "600", "color": COLORS['secondary']}
-            ),
-            html.Div([
-                html.Label("Significance Level (α):", style={"fontWeight": "600", "marginRight": "10px"}),
-                dcc.Slider(
-                    id='alpha-slider',
-                    min=0.01, max=0.2, step=0.01, value=0.05,
-                    marks={0.01: '0.01', 0.05: '0.05', 0.1: '0.1', 0.2: '0.2'},
-                    tooltip={"placement": "bottom", "always_visible": False},
-                    included=False,
-                    updatemode='drag',
-                    className="mb-2",
-                    disabled=True  # 기본 비활성화
-                ),
-            ], style={"marginBottom": "18px"}),
-            html.Div([
-                html.Label("Multiple Comparison Correction:", style={"fontWeight": "600", "marginRight": "10px"}),
-                dcc.Dropdown(
-                    id='correction-method-dropdown',
-                    options=[
-                        {"label": "None", "value": "none"},
-                        {"label": "Bonferroni", "value": "bonferroni"},
-                        {"label": "Holm", "value": "holm"},
-                        {"label": "Benjamini-Hochberg (FDR)", "value": "fdr_bh"}
-                    ],
-                    value="none",
-                    clearable=False,
-                    style={"width": "70%"},
-                    disabled=True  # 기본 비활성화
-                )
-            ], style={"marginBottom": "18px"}),
-            html.Div([
-                html.Label("Effect Size Threshold (Cohen's d):", style={"fontWeight": "600", "marginRight": "10px"}),
-                dcc.Slider(
-                    id='effect-size-threshold-slider',
-                    min=0, max=2, step=0.05, value=0,
-                    marks={0: '0', 0.2: '0.2', 0.5: '0.5', 0.8: '0.8', 1.0: '1.0', 1.5: '1.5', 2.0: '2.0'},
-                    tooltip={"placement": "bottom", "always_visible": False},
-                    included=False,
-                    updatemode='drag',
-                    className="mb-2",
-                    disabled=True  # 기본 비활성화
-                ),
-            ])
-        ], style={"marginBottom": "25px"}),
-
-        # Section 5: Color Direction Settings
-        html.Div([
-            html.H5("5. 🎨 Color Direction Settings", 
-                    style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
-            html.P("Set color direction for each stat in change tables:", 
-                   style={"fontSize": "0.9em", "color": COLORS['gray'], "marginBottom": "10px"}),
-            html.Div(id='color-direction-controls', style={"marginBottom": "10px"}),
-            dbc.Button("Apply Colors", id="apply-colors-btn", color="secondary", size="sm", className="mt-2"),
-            html.P(id='color-direction-status', 
-                   style={"fontSize": "0.9em", "color": COLORS['gray'], "marginTop": "5px"}),
-        ], style={"marginBottom": "25px"}),
-
-        # Analysis Button
-        dbc.Button("🚀 Start Analysis", id="run-button", 
-                  color="primary", className="my-3 w-100",
-                  style={"backgroundColor": COLORS['secondary'], "borderColor": COLORS['secondary'], 
-                         "fontWeight": "600", "fontSize": "1.1em", "padding": "12px"}),
-        dbc.Tooltip(
-            "Click to start analyzing the selected directories. This will process all .out files and generate comparison reports.",
-            target="run-button",
-            placement="top"
-        ),
-        
-        # Progress and Info
-        html.Div(id="progress-wrapper", 
-                children=[dbc.Progress(id="progress-bar", value=100, striped=True, animated=True)], 
-                style={'display': 'none'}),
-        html.Div(id="analysis-info-start", className="mt-3"),
-        html.Div(id="analysis-info-complete", className="mt-3"),
-        # Footer
-        html.Footer([
-            html.Hr(style={"borderColor": COLORS['light'], "margin": "30px 0"}),
-            dbc.Row([
-                dbc.Col([
-                    html.Div([
-                        html.Span("Monaco Simulation Analyzer — Created by dong63.ma", 
-                                  style={"color": COLORS['primary'], "fontWeight": "600", "marginRight": "15px"}),
-                        html.Span("| Version: v1.0.0", 
-                                  style={"color": COLORS['gray'], "marginRight": "15px"}),
-                        html.Span("| Last updated: 2025-07-21", 
-                                  style={"color": COLORS['gray'], "marginRight": "15px"}),
-                        html.Span(f"| Python {sys.version_info.major}.{sys.version_info.minor} | Dash {dash.__version__} | Plotly {plotly.__version__}", 
-                                  style={"color": COLORS['gray']})
-                    ], style={"textAlign": "center", "fontSize": "0.95em"})
-                ], width=12)
-            ])
-        ])
-    ])
-], style={"border": f"1px solid {COLORS['light']}", "boxShadow": "0 2px 10px rgba(0,0,0,0.1)"})
-
 # --- percentage-change-tab 상단 옵션 UI 추가 ---
 stat_options = [{'label': stat, 'value': stat} for stat in STATS_TO_FIND]
-
-app.layout = dbc.Container([
-    dbc.Row([
-        # Sidebar (좌측) - 접힘 가능
-        dbc.Col([
-            # 접힘 버튼 (항상 보임)
-            dbc.Row([
-                dbc.Col([
-                    dbc.Button("◀", id="sidebar-toggle", color="light", size="sm", 
-                              style={"backgroundColor": COLORS['white'], "borderColor": COLORS['gray'], 
-                                     "color": COLORS['dark'], "fontWeight": "bold", "float": "right"})
-                ], width=12, className="text-end mb-2")
-            ]),
-            # 사이드바 헤더 (접힘 가능)
-            dbc.Collapse([
-                html.H2("Options", className="display-6 mb-3", style={"color": COLORS['primary'], "fontWeight": "700"}),
-                html.Hr(),
-            ], id="sidebar-header", is_open=True),
-            # 사이드바 내용 (접힘 가능)
-            dbc.Collapse([
-                controls,
-                # 도움말 버튼 추가
-                html.Hr(className="my-4"),
-                dbc.Button("❓ Help Guide", id="help-button", color="info", size="lg", className="w-100",
-                          style={"backgroundColor": COLORS['info'], "borderColor": COLORS['info'], "fontWeight": "600"}),
-            ], id="sidebar-content", is_open=True),
-        ], id="sidebar-col", width=3, style={
-            "backgroundColor": COLORS['light'],
-            "minHeight": "100vh",
-            "padding": "30px 15px",
-            "boxShadow": "2px 0 8px rgba(0,0,0,0.04)",
-            "transition": "all 0.3s ease"
-        }),
-        # Main content (우측) - 반응형
-        dbc.Col([
-            # Header
-            html.H1("📊 Monaco Simulation Results Analyzer", 
-                    className="text-center mb-3",
-                    style={"color": COLORS['primary'], "fontWeight": "700", "fontSize": "2.5em"}),
-            html.P("Advanced simulation data analysis and comparison dashboard", 
-                   className="text-center mb-4",
-                   style={"color": COLORS['gray'], "fontSize": "1.1em", "fontStyle": "italic"}),
-            # Save HTML Button (오른쪽 상단, 작게)
-            html.Div([
-                dbc.Button(
-                    "💾 Save as HTML", id="save-html-btn",
-                    color="secondary", size="sm", outline=True,
-                    className="float-end mt-2 me-2",
-                    style={"fontWeight": "600", "boxShadow": "0 1px 4px rgba(0,0,0,0.07)"}
-                ),
-                dbc.Tooltip(
-                    "Save the current dashboard view as an HTML file (including graphs, filters, etc.)",
-                    target="save-html-btn",
-                    placement="left"
-                ),
-                html.Div(id="save-status", className="float-end me-2", style={"fontSize": "0.95em", "marginTop": "2.5rem"})
-            ], style={"minHeight": "40px", "position": "relative"}),
-            # Main Tabs
-            dbc.Tabs(id="tabs-container", children=[
-                dbc.Tab(html.Div(id="absolute-values-tab"), label="📈 Absolute Values", 
-                        tab_id="absolute", label_style={"color": COLORS['primary'], "fontWeight": "600"}),
-                dbc.Tab(html.Div(id="percentage-change-tab"), label="📊 Performance Change", 
-                        tab_id="change", label_style={"color": COLORS['primary'], "fontWeight": "600"}),
-                dbc.Tab(
-                    html.Div([
-                        html.H3("Detailed Run Table", className="mt-3"),
-                        dcc.Dropdown(id='detailed-group-subgroup-dropdown', options=[], placeholder="Select test group/subgroup...", style={"marginBottom": "20px"}),
-                        html.Div(id='detailed-run-table-container')
-                    ]),
-                    label="🧾 Detailed Run Table",
-                    tab_id="detailed-run-tab",
-                    label_style={"color": COLORS['primary'], "fontWeight": "600"}
-                ),
-                dbc.Tab(
-                    html.Div([
-                        html.H3("Stat Comparison", className="mt-3"),
-                        html.Div([
-                            html.Label("Select Groups:", style={"fontWeight": "600", "marginBottom": "5px"}),
-                            html.Div([
-                                html.P("Choose one or more groups to compare all stats:", style={"fontSize": "0.9em", "color": COLORS['gray'], "marginBottom": "8px"}),
-                                dcc.Checklist(id='group-comparison-checklist', options=[], 
-                                             labelClassName="me-3", inputClassName="me-1",
-                                             style={"color": COLORS['dark']})
-                            ], style={"marginBottom": "15px"})
-                        ]),
-                        html.Div(id='stat-comparison-table-container')
-                    ]),
-                    label="📊 Stat Comparison",
-                    tab_id="stat-comparison-tab",
-                    label_style={"color": COLORS['primary'], "fontWeight": "600"}
-                ),
-            ], style={"marginBottom": "30px"}),
-            # Stores (hidden)
-            dcc.Store(id='job-start-time-store'),
-            dcc.Store(id='summary-data-store'),
-            dcc.Store(id='change-data-store'),
-            dcc.Store(id='dir-names-store'),
-            dcc.Store(id='run-change-data-store'),
-            dcc.Store(id='analysis-meta-store'),
-            dcc.Interval(id='progress-interval', interval=1000, disabled=True),
-            dcc.Store(id='stats-store', data=STATS_TO_FIND),
-            dcc.Store(id='stat-matched-keys-store'), # 추가: stat-matched-keys-store
-            dcc.Store(id='analysis-complete-store'), # 분석 완료 전용 Store
-            dcc.Store(id='study-out-dir-store', data=STUDY_OUT_DIR), # 추가: study_out_dir Store
-            dcc.Store(id='color-direction-store', data=DEFAULT_COLOR_DIRECTIONS), # 추가: 색상 방향 설정 Store
-            # Footer
-            html.Footer([
-                html.Hr(style={"borderColor": COLORS['light'], "margin": "30px 0"}),
-                dbc.Row([
-                    dbc.Col([
-                        html.Div([
-                            html.Span("Monaco Simulation Analyzer — Created by dong63.ma", 
-                                      style={"color": COLORS['primary'], "fontWeight": "600", "marginRight": "15px"}),
-                            html.Span("| Version: v1.0.0", 
-                                      style={"color": COLORS['gray'], "marginRight": "15px"}),
-                            html.Span("| Last updated: 2025-01-20", 
-                                      style={"color": COLORS['gray'], "marginRight": "15px"}),
-                            html.Span(f"| Python {sys.version_info.major}.{sys.version_info.minor} | Dash {dash.__version__} | Plotly {plotly.__version__}", 
-                                      style={"color": COLORS['gray']})
-                        ], style={"textAlign": "center", "fontSize": "0.95em"})
-                    ], width=12)
-                ])
-            ])
-        ], width=9, style={"padding": "30px 30px", "backgroundColor": COLORS['white']})
-    ], className="g-0", style={"minHeight": "100vh"}),
-    
-    # 도움말 모달
-    dbc.Modal([
-        dbc.ModalHeader([
-            dbc.ModalTitle("📖 Monaco Simulation Analyzer - User Guide", 
-                           style={"color": COLORS['primary'], "fontWeight": "600"})
-        ], style={"backgroundColor": COLORS['light']}),
-        dbc.ModalBody([
-            html.H5("🚀 Quick Start", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
-            html.Ol([
-                html.Li([
-                    html.Strong("Select Baseline Directory: "),
-                    "Choose the reference directory containing your baseline simulation results"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Select Target Directories: "),
-                    "Choose one or more directories to compare against the baseline"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Optional: Add Manual Paths: "),
-                    "Enter additional directory paths not listed in the dropdown"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Edit Stat List: "),
-                    "Modify the list of statistics to analyze (or edit stats.txt file)"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Configure Statistical Options: "),
-                    "Enable significance testing, set α level, correction method, and effect size threshold"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Set Color Directions: "),
-                    "Choose color direction for each stat (🔴 Red for + or 🟢 Green for +) in change tables"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Start Analysis: "),
-                    "Click 'Start Analysis' to process all .out files and generate reports"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Explore Results: "),
-                    "View absolute values, performance changes, and detailed run-level data in the tabs"
-                ], style={"marginBottom": "8px"})
-            ], style={"marginBottom": "20px"}),
-
-            html.H5("📊 Understanding Results", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
-            html.Ul([
-                html.Li([
-                    html.Strong("Absolute Values Tab: "),
-                    "Raw performance metrics for each directory with drill-down to run-level data"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Performance Change Tab: "),
-                    "Percentage changes with statistical significance (★) and effect size (Cohen's d)"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Detailed Run Table Tab: "),
-                    "Run-by-run comparison showing absolute values and changes side by side"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Statistical Significance: "),
-                    "★ indicates statistically significant changes (p-adj < α)"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Effect Size: "),
-                    "Cohen's d: ~0.2 (small), ~0.5 (medium), ~0.8+ (large)"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Color Coding: "),
-                    "Green/red pastel colors indicate improvement/regression magnitude. Customizable direction per stat"
-                ], style={"marginBottom": "8px"})
-            ], style={"marginBottom": "20px"}),
-
-            html.H5("⚙️ Key Features", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
-            html.Ul([
-                html.Li("Automatic .out file discovery and parsing"),
-                html.Li("Multi-processor analysis for fast processing"),
-                html.Li("Statistical significance testing with multiple comparison corrections"),
-                html.Li("Effect size analysis (Cohen's d)"),
-                html.Li("Interactive drill-down from summary to run-level data"),
-                html.Li("CSV export for all tables"),
-                html.Li("HTML snapshot saving"),
-                html.Li("Customizable stat list"),
-                html.Li("Natural sorting of run names (run1, run2, ..., run10)"),
-                html.Li("Responsive design for all screen sizes")
-            ], style={"marginBottom": "20px"}),
-
-            html.H5("💡 Tips", style={"color": COLORS['primary'], "fontWeight": "600", "marginBottom": "15px"}),
-            html.Ul([
-                html.Li("Use the sidebar toggle (◀/▶) to maximize viewing area"),
-                html.Li("Click on table cells to drill down to run-level details"),
-                html.Li("Adjust statistical options for more rigorous analysis"),
-                html.Li("Export tables for further analysis in external tools"),
-                html.Li("Save HTML snapshots to preserve current view with all filters")
-            ])
-        ]),
-        dbc.ModalFooter([
-            dbc.Button("Close", id="close-help", className="ms-auto", 
-                      style={"backgroundColor": COLORS['secondary'], "borderColor": COLORS['secondary']})
-        ])
-    ], id="help-modal", is_open=False, size="lg")
-], fluid=True)
 
 # --- 콜백 함수들 ---
 # [설명] 사용자 인터랙션(분석 시작, 진행/완료 표시, 데이터 분석, 시각화 등)에 따라 동적으로 UI를 업데이트하는 Dash 콜백 함수들입니다.
 
-# 통계 옵션 활성화 체크박스에 따라 슬라이더/드롭다운 활성화
-@app.callback(
-    [Output('alpha-slider', 'disabled'),
-     Output('correction-method-dropdown', 'disabled'),
-     Output('effect-size-threshold-slider', 'disabled')],
-    Input('enable-statistical-options', 'value')
-)
-def toggle_statistical_options(enabled):
-    disabled = not enabled
-    return [disabled, disabled, disabled]
 
-# 콜백 1: '분석 시작' 버튼 클릭 시, 스토어 초기화, 진행률 바 활성화, 버튼 비활성화
-@app.callback(
-    [Output('job-start-time-store', 'data'),
-     Output('progress-interval', 'disabled'),
-     Output('progress-wrapper', 'style'),
-     Output('run-button', 'disabled'),
-     Output('summary-data-store', 'data', allow_duplicate=True),
-     Output('change-data-store', 'data', allow_duplicate=True),
-     Output('dir-names-store', 'data', allow_duplicate=True),
-     Output('analysis-meta-store', 'data')],
-    Input('run-button', 'n_clicks'),
-    State('baseline-dropdown', 'value'),
-    State('target-checklist', 'value'),
-    State('manual-path-input', 'value'),
-    State('study-out-dir-store', 'data'), # 추가
-    prevent_initial_call=True,
-)
-def start_analysis_job(n_clicks, baseline_dir, target_dirs_checked, manual_paths, study_out_dir):
-    import datetime, time, os
-    start_time = time.time()
-    def resolve_path(p):
-        if not p:
-            return None
-        if os.path.isabs(p):
-            return p
-        return str(Path(study_out_dir) / p)
-    dirs = [resolve_path(baseline_dir)] if baseline_dir else []
-    if target_dirs_checked:
-        dirs += [resolve_path(p) for p in target_dirs_checked]
-    if manual_paths:
-        dirs += [resolve_path(p.strip()) for p in manual_paths.split('\n') if p.strip()]
-    dirs = [d for d in dict.fromkeys(dirs) if d]
-    start_str = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
-    meta = {'dirs': dirs, 'start_str': start_str}
-    # summary-data-store.data를 항상 None으로 리셋
-    return start_time, False, {'display': 'block'}, True, None, None, None, meta
-
-# 콜백 2: [백그라운드] 실제 분석을 수행하고 결과를 dcc.Store에 저장
-def cohens_d(x, y):
-    # 두 집단의 Cohen's d
-    nx, ny = len(x), len(y)
-    if nx < 2 or ny < 2:
-        return np.nan
-    mean_x, mean_y = np.mean(x), np.mean(y)
-    s1, s2 = np.var(x, ddof=1), np.var(y, ddof=1)
-    pooled_std = np.sqrt(((nx - 1) * s1 + (ny - 1) * s2) / (nx + ny - 2))
-    if pooled_std == 0:
-        return 0.0
-    return (mean_x - mean_y) / pooled_std
 
 # 2. stat 목록 편집 콜백
 @app.callback(
@@ -607,24 +160,6 @@ KEY_VALUE_PATTERN = re.compile(r"^\s*(\S+)\s*=\s*([-+]?(?:\d*\.\d+|\d+)(?:[eE][-
 def natural_key(s):
     """자연스러운 정렬을 위한 키 함수 (run1, run2, ..., run10 순서)"""
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', str(s))]
-
-def find_subdirectories(base_path: Path, depth: int) -> list:
-    # [설명] 기준 경로에서 지정한 depth까지 하위 디렉토리를 탐색해 목록을 반환합니다.
-    dirs = set()
-    if not base_path.is_dir(): return []
-    with os.scandir(base_path) as it:
-        for entry in it:
-            if entry.is_dir():
-                dirs.add(str(Path(entry.path).resolve()))
-                if depth > 1:
-                    try:
-                        with os.scandir(entry.path) as sub_it:
-                            for sub_entry in sub_it:
-                                if sub_entry.is_dir():
-                                    dirs.add(str(Path(sub_entry.path).resolve()))
-                    except PermissionError:
-                        continue
-    return sorted(list(dirs))
 
 # --- Dash 앱 구성 ---
 # [설명] Dash 앱 객체, 서버, 타이틀, 외부 스타일, 백그라운드 콜백 매니저 등을 설정합니다.
@@ -857,10 +392,8 @@ app.layout = dbc.Container([
             ], style={"minHeight": "40px", "position": "relative"}),
             # Main Tabs
             dbc.Tabs(id="tabs-container", children=[
-                dbc.Tab(html.Div(id="absolute-values-tab"), label="📈 Absolute Values", 
+                dbc.Tab(html.Div(id="absolute-values-tab"), label="📈 Combined Analysis", 
                         tab_id="absolute", label_style={"color": COLORS['primary'], "fontWeight": "600"}),
-                dbc.Tab(html.Div(id="percentage-change-tab"), label="📊 Performance Change", 
-                        tab_id="change", label_style={"color": COLORS['primary'], "fontWeight": "600"}),
                 dbc.Tab(
                     html.Div([
                         html.H3("Detailed Run Table", className="mt-3"),
@@ -972,10 +505,6 @@ app.layout = dbc.Container([
                 html.Li([
                     html.Strong("Absolute Values Tab: "),
                     "Raw performance metrics for each directory with drill-down to run-level data"
-                ], style={"marginBottom": "8px"}),
-                html.Li([
-                    html.Strong("Performance Change Tab: "),
-                    "Percentage changes with statistical significance (★) and effect size (Cohen's d)"
                 ], style={"marginBottom": "8px"}),
                 html.Li([
                     html.Strong("Detailed Run Table Tab: "),
@@ -1292,15 +821,20 @@ def update_progress_label(n_intervals, summary_data, start_time):
     label = f"Analysis in progress... (Elapsed time: {td})"
     return label, False, {'display': 'block'}, True
 
-# 콜백 4: Store의 절대값 데이터로 '절대값 분석' 탭 내용을 생성
+# 콜백 4: Store의 절대값 데이터와 변화율 데이터를 합쳐서 통합 테이블 생성
 @app.callback(
     Output("absolute-values-tab", "children"),
     [Input("summary-data-store", "data"),
+     Input("change-data-store", "data"),
      State("dir-names-store", "data"),
+     State("alpha-slider", "value"),
+     State("effect-size-threshold-slider", "value"),
      State('stats-store', 'data'),
-     State('stat-matched-keys-store', 'data')]
+     State('stat-matched-keys-store', 'data'),
+     State('enable-statistical-options', 'value'),
+     State('color-direction-store', 'data')]
 )
-def update_absolute_values_tab(summaries_json, dir_names, stats_to_find, matched_keys):
+def update_combined_values_tab(summaries_json, change_dfs_json, dir_names, alpha, effect_size_threshold, stats_to_find, matched_keys, enable_statistical_options, color_directions):
     if summaries_json is None:
         return "Please start analysis or wait for it to complete."
     
@@ -1308,15 +842,16 @@ def update_absolute_values_tab(summaries_json, dir_names, stats_to_find, matched
     weights_dict = load_weights_from_json('./weights.json')
     
     output_components = []
+    
+    # 각 그룹(디렉토리)별로 처리
     for i, summary_json in enumerate(summaries_json):
         if summary_json is None:
             continue
+            
         dir_name = dir_names[i]
         summary_df = pd.read_json(StringIO(summary_json), orient='split')
-        output_components.append(html.H3(f"📁 {dir_name} Absolute Value Analysis", className="mt-4"))
-        # 파일명 생성
-        now_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        # subgroup별 stat별 가중 평균 테이블
+        
+        # 절대값 데이터 준비
         if {'Subgroup', 'Stat', 'Value', 'Run'}.issubset(summary_df.columns):
             # 가중 평균 계산
             weighted_avg_records = []
@@ -1338,32 +873,141 @@ def update_absolute_values_tab(summaries_json, dir_names, stats_to_find, matched
                 })
             
             pivot_df = pd.DataFrame(weighted_avg_records)
-            table_df = pivot_df.pivot(index='Subgroup', columns='Stat', values='Value')
+            abs_table_df = pivot_df.pivot(index='Subgroup', columns='Stat', values='Value')
+            
             # stat-list 기준 컬럼 보장
             for stat in stats_to_find:
-                if stat not in table_df.columns:
-                    table_df[stat] = np.nan
-            table_df = table_df[stats_to_find]
-            table_df = table_df.reset_index().round(4)
-            # 평균(min) 행 추가
-            stat_cols = [col for col in table_df.columns if col != 'Subgroup']
-            min_row = {'Subgroup': 'mean'}
+                if stat not in abs_table_df.columns:
+                    abs_table_df[stat] = np.nan
+            abs_table_df = abs_table_df[stats_to_find]
+            abs_table_df = abs_table_df.reset_index().round(4)
+            
+            # 평균 행 추가
+            stat_cols = [col for col in abs_table_df.columns if col != 'Subgroup']
+            mean_row = {'Subgroup': 'mean'}
             for stat in stat_cols:
-                min_row[stat] = table_df[stat].mean()  # 평균, min으로 바꾸려면 .min()
-            table_df = pd.concat([table_df, pd.DataFrame([min_row])], ignore_index=True)
+                mean_row[stat] = abs_table_df[stat].mean()
+            abs_table_df = pd.concat([abs_table_df, pd.DataFrame([mean_row])], ignore_index=True)
         else:
-            table_df = summary_df.round(4)
+            abs_table_df = summary_df.round(4)
+        
+        # 변화율 데이터 준비 (baseline과 비교)
+        change_table_df = None
+        if change_dfs_json and i > 0:  # baseline이 아닌 경우에만
+            change_json = change_dfs_json[i-1]  # i-1 because change_dfs_json starts from target1
+            if change_json is not None:
+                change_table_df = pd.read_json(StringIO(change_json), orient='split')
+                # MultiIndex → 단일 인덱스(str)
+                change_table_df.columns = [
+                    col if col == 'Subgroup' else f"{col[0]}_{col[1]}"
+                    for col in change_table_df.columns
+                ]
+                
+                # stat-list 기준 컬럼 보장
+                for stat in stats_to_find:
+                    if f"{stat}_Change" not in change_table_df.columns:
+                        change_table_df[f"{stat}_Change"] = np.nan
+                    if enable_statistical_options:
+                        if f"{stat}_p-adj" not in change_table_df.columns:
+                            change_table_df[f"{stat}_p-adj"] = np.nan
+                        if f"{stat}_d" not in change_table_df.columns:
+                            change_table_df[f"{stat}_d"] = np.nan
+        
+        # 통합 테이블 생성
+        combined_data = []
+        subgroups = abs_table_df['Subgroup'].tolist()
+        
+        for subgroup in subgroups:
+            row_data = {'Subgroup': subgroup}
+            
+            for stat in stats_to_find:
+                # 절대값
+                abs_value = abs_table_df[abs_table_df['Subgroup'] == subgroup][stat].iloc[0] if not abs_table_df[abs_table_df['Subgroup'] == subgroup].empty else np.nan
+                row_data[f"{stat}_Abs"] = f"{abs_value:.4f}" if pd.notna(abs_value) else ''
+                
+                # 변화율 (baseline이 아닌 경우에만)
+                if change_table_df is not None:
+                    if subgroup == 'mean':
+                        # mean 행의 경우 change 값들의 평균 계산
+                        change_values = change_table_df[f"{stat}_Change"].dropna()
+                        if len(change_values) > 0:
+                            change_value = change_values.mean()
+                        else:
+                            change_value = np.nan
+                    else:
+                        # 일반 subgroup의 경우 해당 subgroup의 change 값
+                        change_value = change_table_df[change_table_df['Subgroup'] == subgroup][f"{stat}_Change"].iloc[0] if not change_table_df[change_table_df['Subgroup'] == subgroup].empty else np.nan
+                    
+                    if enable_statistical_options:
+                        if subgroup == 'mean':
+                            # mean 행의 경우 통계적 유의성 표시 없음
+                            row_data[f"{stat}_Change"] = f"{change_value:.2f}" if pd.notna(change_value) else ''
+                        else:
+                            padj_col = f"{stat}_p-adj"
+                            pval = change_table_df[change_table_df['Subgroup'] == subgroup][padj_col].iloc[0] if not change_table_df[change_table_df['Subgroup'] == subgroup].empty else np.nan
+                            symbol = ' ★' if pd.notna(pval) and pval < alpha else ''
+                            row_data[f"{stat}_Change"] = f"{change_value:.2f}{symbol}" if pd.notna(change_value) else ''
+                    else:
+                        row_data[f"{stat}_Change"] = f"{change_value:.2f}" if pd.notna(change_value) else ''
+                else:
+                    row_data[f"{stat}_Change"] = ''
+            
+            combined_data.append(row_data)
+        
+        # 컬럼 정의
+        dash_columns = [{"name": "Subgroup", "id": "Subgroup"}]
+        for stat in stats_to_find:
+            dash_columns.extend([
+                {"name": [stat, 'Abs'], "id": f"{stat}_Abs"},
+                {"name": [stat, 'Change (%)'], "id": f"{stat}_Change"}
+            ])
+        
+        # 색상 조건 설정
+        style_data_conditional = []
+        for stat in stats_to_find:
+            change_col = f"{stat}_Change"
+            if change_table_df is not None:
+                change_values = []
+                for row in combined_data:
+                    change_val_str = row[change_col].replace(' ★', '').replace('', '')
+                    if change_val_str and change_val_str != '':
+                        try:
+                            change_values.append(float(change_val_str))
+                        except:
+                            pass
+                
+                if change_values:
+                    vmin = min(change_values)
+                    vmax = max(change_values)
+                    
+                    for irow, row in enumerate(combined_data):
+                        change_val_str = row[change_col].replace(' ★', '').replace('', '')
+                        if change_val_str and change_val_str != '':
+                            try:
+                                change_val = float(change_val_str)
+                                color = get_pastel_gradient_color(change_val, vmin, vmax, stat, color_directions.get(stat))
+                                style_data_conditional.append({
+                                    'if': {'row_index': irow, 'column_id': change_col},
+                                    'backgroundColor': color,
+                                    'color': 'black'
+                                })
+                            except:
+                                pass
+        
         output_components.extend([
-            html.H4("Data Table", className="mt-3"),
+            html.H3(f"📁 {dir_name} Combined Analysis", className="mt-4"),
+            html.H4("Absolute Values & Change (%)", className="mt-3"),
             dash_table.DataTable(
-                id={'type': 'abs-table', 'index': i},
-                data=table_df.round(4).to_dict('records'),
+                id={'type': 'combined-table', 'index': i},
+                data=combined_data,
+                columns=dash_columns,
                 style_table={'overflowX': 'auto'},
+                style_data_conditional=style_data_conditional,
                 style_cell={
                     'textAlign': 'center',
                     'minWidth': '80px',
-                    'maxWidth': '220px',
-                    'width': '90px',
+                    'maxWidth': '120px',
+                    'width': '100px',
                     'overflow': 'hidden',
                     'textOverflow': 'ellipsis',
                     'whiteSpace': 'nowrap',
@@ -1374,7 +1018,7 @@ def update_absolute_values_tab(summaries_json, dir_names, stats_to_find, matched
                 row_selectable='single',
                 cell_selectable=True,
             ),
-            html.Div(id={'type': 'abs-run-drilldown', 'index': i}),
+            html.Div(id={'type': 'combined-run-drilldown', 'index': i}),
             # Stat-to-actual-key mapping summary
             html.Div([
                 html.H6("Stat-to-actual-key mapping:"),
@@ -1383,11 +1027,12 @@ def update_absolute_values_tab(summaries_json, dir_names, stats_to_find, matched
                 ])
             ], style={"fontSize": "0.95em", "color": "#888", "marginTop": "10px"})
         ])
-        # group별, stat별 그래프 (subgroup별 가중 평균)
+        
+        # 그래프 추가 (절대값과 변화율)
         if {'Subgroup', 'Stat', 'Value'}.issubset(summary_df.columns):
             stat_graphs = []
             for stat in stats_to_find:
-                # 가중 평균 데이터로 그래프 생성
+                # 절대값 그래프
                 stat_weighted_records = []
                 for (group, subgroup), group_df in summary_df.groupby(['Group', 'Subgroup']):
                     stat_df = group_df[group_df['Stat'] == stat]
@@ -1408,7 +1053,7 @@ def update_absolute_values_tab(summaries_json, dir_names, stats_to_find, matched
                 
                 if stat_weighted_records:
                     stat_df = pd.DataFrame(stat_weighted_records)
-                    fig = px.bar(stat_df, x='Subgroup', y='Value', title=f"{dir_name} - {stat} (Weighted Average)", 
+                    fig = px.bar(stat_df, x='Subgroup', y='Value', title=f"{dir_name} - {stat} (Absolute)", 
                                  labels={'Value': stat, 'Subgroup': 'Subgroup'},
                                  color_discrete_sequence=[PLOTLY_COLORS[i % len(PLOTLY_COLORS)]])
                     fig.update_layout(title_x=0.5, 
@@ -1416,8 +1061,33 @@ def update_absolute_values_tab(summaries_json, dir_names, stats_to_find, matched
                                      paper_bgcolor=COLORS['white'],
                                      font={'color': COLORS['dark']})
                     stat_graphs.append(dbc.Col(dcc.Graph(figure=fig), width=12, lg=6, xl=4))
-            output_components.append(dbc.Row(stat_graphs))
+            
+            # 변화율 그래프 (baseline이 아닌 경우에만)
+            if change_table_df is not None:
+                for stat in stats_to_find:
+                    stat_col = f"{stat}_Change"
+                    if stat_col in change_table_df.columns:
+                        graph_df = change_table_df[['Subgroup', stat_col]].copy()
+                        graph_df = graph_df[graph_df['Subgroup'] != 'mean']
+                        graph_df = graph_df.dropna(subset=['Subgroup', stat_col])
+                        graph_df = graph_df[graph_df['Subgroup'] != '']
+                        graph_df = graph_df.reset_index(drop=True)
+                        
+                        if not graph_df.empty and len(graph_df['Subgroup']) == len(graph_df[stat_col]):
+                            fig = px.bar(graph_df, x='Subgroup', y=stat_col, title=f"{dir_name} - {stat} (Change %)", 
+                                         labels={stat_col: 'Change (%)', 'Subgroup': 'Subgroup'},
+                                         color_discrete_sequence=[PLOTLY_COLORS[(i+1) % len(PLOTLY_COLORS)]])
+                            fig.update_layout(title_x=0.5,
+                                             plot_bgcolor=COLORS['white'],
+                                             paper_bgcolor=COLORS['white'],
+                                             font={'color': COLORS['dark']})
+                            stat_graphs.append(dbc.Col(dcc.Graph(figure=fig), width=12, lg=6, xl=4))
+            
+            if stat_graphs:
+                output_components.append(dbc.Row(stat_graphs))
+        
         output_components.append(html.Hr())
+    
     return output_components
 
 # --- 파스텔톤 히트맵 색상 함수 ---
@@ -1474,154 +1144,7 @@ def get_pastel_gradient_color(value, vmin, vmax, stat_name=None, color_direction
     else:
         return 'white'
 
-@app.callback(
-    Output("percentage-change-tab", "children"),
-    [Input("change-data-store", "data"),
-     State("dir-names-store", "data"),
-     State("alpha-slider", "value"),
-     State("effect-size-threshold-slider", "value"),
-     State('stats-store', 'data'),
-     State('stat-matched-keys-store', 'data'),
-     State('enable-statistical-options', 'value'),
-     State('color-direction-store', 'data')]
-)
-def update_percentage_change_tab(change_dfs_json, dir_names, alpha, effect_size_threshold, stats_to_find, matched_keys, enable_statistical_options, color_directions):
-    output_components = []
-    if change_dfs_json is None:
-        output_components.append("Please start analysis or wait for it to complete.")
-        return output_components
-    if not change_dfs_json:
-        output_components.append("No comparison targets or analysis results.")
-        return output_components
-    baseline_dir_name = dir_names[0]
-    for i, change_json in enumerate(change_dfs_json):
-        target_dir_name = dir_names[i+1]
-        comp_title = f"'{baseline_dir_name}' (Baseline) vs. '{target_dir_name}'"
-        now_str = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_components.extend([
-            html.Hr(className="my-4"),
-            html.H2(f"🔍 Comparison: {comp_title}", className="mt-4")
-        ])
-        if change_json is None:
-            output_components.append(html.P("Comparison failed for target directory."))
-            continue
-        table_df = pd.read_json(StringIO(change_json), orient='split')
-        # MultiIndex → 단일 인덱스(str)
-        table_df.columns = [
-            col if col == 'Subgroup' else f"{col[0]}_{col[1]}"
-            for col in table_df.columns
-        ]
-        # stat-list 기준 컬럼 보장
-        for stat in stats_to_find:
-            if f"{stat}_Change" not in table_df.columns:
-                table_df[f"{stat}_Change"] = np.nan
-            if enable_statistical_options:
-                if f"{stat}_p-adj" not in table_df.columns:
-                    table_df[f"{stat}_p-adj"] = np.nan
-                if f"{stat}_d" not in table_df.columns:
-                    table_df[f"{stat}_d"] = np.nan
-        # 컬럼 순서 맞추기
-        columns = ['Subgroup']
-        for stat in stats_to_find:
-            columns.append(f"{stat}_Change")
-            if enable_statistical_options:
-                columns.extend([f"{stat}_p-adj", f"{stat}_d"])
-        table_df = table_df[columns]
-        stat_cols = [col for col in table_df.columns if col != 'Subgroup' and col.endswith('_Change')]
-        style_data_conditional = []
-        for stat_col in stat_cols:
-            stat = stat_col.replace('_Change', '')
-            vmin = table_df[stat_col].min()
-            vmax = table_df[stat_col].max()
-            for irow, row in table_df.iterrows():
-                color = get_pastel_gradient_color(row[stat_col], vmin, vmax, stat, color_directions[stat])
-                style_data_conditional.append({
-                    'if': {'row_index': irow, 'column_id': stat_col},
-                    'backgroundColor': color,
-                    'color': 'black'
-                })
-        # 컬럼 정의
-        dash_columns = []
-        for stat in stats_to_find:
-            dash_columns.append({"name": [stat, 'Change (%)'], "id": f"{stat}_Change", "presentation": "markdown"})
-            if enable_statistical_options:
-                dash_columns.append({"name": [stat, 'p-adj'], "id": f"{stat}_p-adj"})
-                dash_columns.append({"name": [stat, 'd'], "id": f"{stat}_d"})
-        dash_columns = [{"name": "Subgroup", "id": "Subgroup"}] + dash_columns
-        # 데이터: 변화율+유의성 심벌(★)
-        data = []
-        for irow, row in table_df.iterrows():
-            d = {}
-            for col in table_df.columns:
-                if col.endswith('_Change'):
-                    val = row[col]
-                    if enable_statistical_options:
-                        padj_col = col.replace('_Change', '_p-adj')
-                        d_col = col.replace('_Change', '_d')
-                        pval = row[padj_col] if padj_col in table_df.columns else None
-                        d_val = row[d_col] if d_col in table_df.columns else None
-                        symbol = ''
-                        if pd.notna(pval) and pval < alpha:
-                            symbol = ' ★'
-                        if pd.notna(val):
-                            d[col] = f"{val:.2f}{symbol}"
-                        else:
-                            d[col] = ''
-                    else:
-                        d[col] = f"{val:.2f}" if pd.notna(val) else ''
-                elif enable_statistical_options and col.endswith('_p-adj'):
-                    val = row[col]
-                    d[col] = f"{val:.4f}" if pd.notna(val) else ''
-                elif enable_statistical_options and col.endswith('_d'):
-                    val = row[col]
-                    d[col] = f"{val:.4f}" if pd.notna(val) else ''
-                else:
-                    d[col] = row[col]
-            data.append(d)
-        output_components.extend([
-            html.H4("Weighted Average Performance Change (%)", className="mt-3"),
-            dash_table.DataTable(
-                id={'type': 'change-table', 'index': i},
-                data=data,
-                columns=dash_columns,
-                style_table={'overflowX': 'auto'},
-                style_data_conditional=style_data_conditional,
-                style_cell={'textAlign': 'center', 'minWidth': '80px', 'maxWidth': '100px', 'width': '90px'},
-                row_selectable='single',
-                cell_selectable=True,
-                export_format='csv',
-                export_headers='display',
-            ),
-            # 드릴다운(run-level) 그래프 컨테이너 추가
-            html.Div(id={'type': 'run-level-graph', 'index': i}),
-            # Stat-to-actual-key mapping summary
-            html.Div([
-                html.H6("Stat-to-actual-key mapping:"),
-                html.Ul([
-                    html.Li(f"{stat}: {', '.join(matched_keys.get(stat, [])) or 'None'}") for stat in stats_to_find
-                ])
-            ], style={"fontSize": "0.95em", "color": "#888", "marginTop": "10px"})
-        ])
-        # --- 그래프 추가 (가중 평균 기반) ---
-        figures = []
-        for stat in stats_to_find:
-            stat_col = f"{stat}_Change"
-            graph_df = table_df[['Subgroup', stat_col]].copy()
-            graph_df = graph_df[graph_df['Subgroup'] != 'mean']
-            graph_df = graph_df.dropna(subset=['Subgroup', stat_col])
-            graph_df = graph_df[graph_df['Subgroup'] != '']
-            graph_df = graph_df.reset_index(drop=True)
-            if not graph_df.empty and len(graph_df['Subgroup']) == len(graph_df[stat_col]):
-                fig = px.bar(graph_df, x='Subgroup', y=stat_col, title=f"{stat} Weighted Average Change (%)", 
-                             labels={stat_col: 'Change (%)', 'Subgroup': 'Subgroup'},
-                             color_discrete_sequence=[PLOTLY_COLORS[i % len(PLOTLY_COLORS)]])
-                fig.update_layout(title_x=0.5,
-                                 plot_bgcolor=COLORS['white'],
-                                 paper_bgcolor=COLORS['white'],
-                                 font={'color': COLORS['dark']})
-                figures.append(dbc.Col(dcc.Graph(figure=fig), width=12, lg=6, xl=4))
-        output_components.append(dbc.Row(figures))
-    return output_components
+
 
 # 드릴다운: row 클릭 시 run별 변화율 테이블(파스텔 히트맵 적용)
 @app.callback(
@@ -2111,16 +1634,17 @@ def parse_file_with_offsets(file_path, offsets, stats_to_find):
 
 # [드릴다운] 절대값 분석 테이블 셀 클릭 시 run별 절대값 테이블 표시
 @app.callback(
-    Output({'type': 'abs-run-drilldown', 'index': MATCH}, 'children'),
-    Input({'type': 'abs-table', 'index': MATCH}, 'active_cell'),
-    State({'type': 'abs-table', 'index': MATCH}, 'data'),
+    Output({'type': 'combined-run-drilldown', 'index': MATCH}, 'children'),
+    Input({'type': 'combined-table', 'index': MATCH}, 'active_cell'),
+    State({'type': 'combined-table', 'index': MATCH}, 'data'),
     State('summary-data-store', 'data'),
+    State('run-change-data-store', 'data'),
     State('dir-names-store', 'data'),
     State('stats-store', 'data'),
     State('color-direction-store', 'data'),
     prevent_initial_call=True,
 )
-def show_abs_run_level_table(active_cell, table_data, summaries_json, dir_names, stats_to_find, color_directions):
+def show_combined_run_level_table(active_cell, table_data, summaries_json, run_change_dfs_json, dir_names, stats_to_find, color_directions):
     if not active_cell or not table_data or not summaries_json or not dir_names:
         return []
     row = table_data[active_cell['row']]
@@ -2147,6 +1671,7 @@ def show_abs_run_level_table(active_cell, table_data, summaries_json, dir_names,
     if not summary_json:
         return []
     summary_df = pd.read_json(StringIO(summary_json), orient='split')
+    
     # run별, stat별 wide format
     if {'Subgroup', 'Run', 'Stat', 'Value', 'Weight'}.issubset(summary_df.columns):
         run_df = summary_df[summary_df['Subgroup'] == subgroup]
@@ -2170,30 +1695,116 @@ def show_abs_run_level_table(active_cell, table_data, summaries_json, dir_names,
         cols = ['Run', 'Weight'] + [col for col in pivot_df.columns if col not in ['Run', 'Weight']]
         pivot_df = pivot_df[cols]
         
-        # 평균 행 추가
-        min_row = {'Run': 'mean'}
-        for stat in stats_to_find:
-            min_row[stat] = pivot_df[stat].mean()
-        min_row['Weight'] = pivot_df['Weight'].mean()  # 평균 가중치
-        pivot_df = pd.concat([pivot_df, pd.DataFrame([min_row])], ignore_index=True)
+        # 변화율 데이터 추가 (baseline이 아닌 경우에만)
+        if run_change_dfs_json and idx > 0:  # baseline이 아닌 경우에만
+            run_change_json = run_change_dfs_json[idx-1]  # i-1 because run_change_dfs_json starts from target1
+            if run_change_json is not None:
+                run_change_df = pd.read_json(StringIO(run_change_json), orient='split')
+                
+                # 해당 subgroup의 run별 변화율 데이터 추출
+                subgroup_run_change_df = run_change_df[run_change_df['Subgroup'] == subgroup]
+                if not subgroup_run_change_df.empty:
+                    # 각 stat에 대한 변화율 컬럼 추가
+                    for stat in stats_to_find:
+                        # run별 변화율 데이터를 pivot_df의 Run과 매칭
+                        for _, run_row in subgroup_run_change_df.iterrows():
+                            run_name = run_row.get('Run', '')
+                            stat_name = run_row.get('Stat', '')
+                            if run_name in pivot_df['Run'].values and stat_name == stat:
+                                change_value = run_row.get('Change', np.nan)
+                                pivot_df.loc[pivot_df['Run'] == run_name, f"{stat}_Change"] = change_value
+        else:
+            # baseline인 경우 change column들을 제거
+            for stat in stats_to_find:
+                change_col = f"{stat}_Change"
+                if change_col in pivot_df.columns:
+                    pivot_df = pivot_df.drop(columns=[change_col])
         
-        return dash_table.DataTable(
-            data=pivot_df.round(4).to_dict('records'),
-            columns=[{"name": c, "id": c} for c in pivot_df.columns],
-            style_table={'overflowX': 'auto'},
-            style_cell={
-                'textAlign': 'center',
-                'minWidth': '80px',
-                'maxWidth': '220px',
-                'width': '90px',
-                'overflow': 'hidden',
-                'textOverflow': 'ellipsis',
-                'whiteSpace': 'nowrap',
-            },
-            page_size=20,
-            export_format='csv',
-            export_headers='display',
-        )
+        # 평균 행 추가
+        mean_row = {'Run': 'mean'}
+        for stat in stats_to_find:
+            mean_row[stat] = pivot_df[stat].mean()
+            if f"{stat}_Change" in pivot_df.columns:
+                mean_row[f"{stat}_Change"] = pivot_df[f"{stat}_Change"].mean() if not pivot_df[f"{stat}_Change"].empty else np.nan
+        mean_row['Weight'] = pivot_df['Weight'].mean()  # 평균 가중치
+        pivot_df = pd.concat([pivot_df, pd.DataFrame([mean_row])], ignore_index=True)
+        
+        # 컬럼 정의 (절대값과 변화율을 함께 표시)
+        dash_columns = [
+            {"name": "Run", "id": "Run"},
+            {"name": "Weight", "id": "Weight"}
+        ]
+        for stat in stats_to_find:
+            dash_columns.append({"name": stat, "id": stat})
+            if f"{stat}_Change" in pivot_df.columns:
+                dash_columns.append({"name": [stat, 'Change(%)'], "id": f"{stat}_Change"})
+        
+        # 데이터 포맷팅
+        data = []
+        for _, row in pivot_df.iterrows():
+            d = {'Run': row['Run'], 'Weight': row['Weight']}
+            for stat in stats_to_find:
+                d[stat] = f"{row[stat]:.4f}" if pd.notna(row[stat]) else ''
+                if f"{stat}_Change" in pivot_df.columns:
+                    change_val = row[f"{stat}_Change"]
+                    d[f"{stat}_Change"] = f"{change_val:.2f}" if pd.notna(change_val) else ''
+            data.append(d)
+        
+        # 색상 조건 설정 (변화율 컬럼에만, baseline이 아닌 경우에만)
+        style_data_conditional = []
+        if idx > 0:  # baseline이 아닌 경우에만 색상 적용
+            for stat in stats_to_find:
+                change_col = f"{stat}_Change"
+                if change_col in pivot_df.columns:
+                    change_values = []
+                    for row in data:
+                        change_val_str = row.get(change_col, '')
+                        if change_val_str and change_val_str != '':
+                            try:
+                                change_values.append(float(change_val_str))
+                            except:
+                                pass
+                    
+                    if change_values:
+                        vmin = min(change_values)
+                        vmax = max(change_values)
+                        
+                        for irow, row in enumerate(data):
+                            change_val_str = row.get(change_col, '')
+                            if change_val_str and change_val_str != '':
+                                try:
+                                    change_val = float(change_val_str)
+                                    color = get_pastel_gradient_color(change_val, vmin, vmax, stat, color_directions.get(stat))
+                                    style_data_conditional.append({
+                                        'if': {'row_index': irow, 'column_id': change_col},
+                                        'backgroundColor': color,
+                                        'color': 'black'
+                                    })
+                                except:
+                                    pass
+        
+        return html.Div([
+            html.H5(f"Run-level data for {subgroup} in {dir_names[idx]}", className="mt-3"),
+            dash_table.DataTable(
+                data=data,
+                columns=dash_columns,
+                style_table={'overflowX': 'auto'},
+                style_data_conditional=style_data_conditional,
+                style_cell={
+                    'textAlign': 'center',
+                    'minWidth': '80px',
+                    'maxWidth': '120px',
+                    'width': '100px',
+                    'overflow': 'hidden',
+                    'textOverflow': 'ellipsis',
+                    'whiteSpace': 'nowrap',
+                },
+                merge_duplicate_headers=True,
+                page_size=20,
+                export_format='csv',
+                export_headers='display',
+            )
+        ])
     return html.P("No run-level data for this subgroup.")
 
 # --- 새로운 탭: Detailed Run Table ---
